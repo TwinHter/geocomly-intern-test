@@ -17,38 +17,35 @@ All tests are kept in `cmd/linker/main_test.go`.
 
 ## Hyperparameters
 
-All tunable values are centralized in `internal/similarity/config.go` inside
-`DefaultConfig()`. Edit that function, then rerun the tests and build.
+All tunable values for the Fellegi-Sunter experiment are in
+`internal/similarity/config.go`, inside `DefaultConfig()`. Edit that function,
+then rerun the tests and build.
 
 ```go
 func DefaultConfig() Config {
     return Config{
-        EmailWeight:        0.50,
-        DeviceWeight:       0.175,
-        PaymentWeight:      0.175,
-        IPWeight:           0.10,
-        TimeWeight:         0.05,
-        MissingValueScore:  0.20,
-        MergeThreshold:     0.44,
-        // Other email, IP, time, and blocking parameters follow.
+        Smoothing:             0.5,
+        LinkEvidenceThreshold: 1.0,
+        EmailM:                [4]float64{0.35, 0.30, 0.20, 0.15},
+        DeviceM:               [2]float64{0.55, 0.45},
+        // Payment, IP, time, bucket, and blocking parameters follow.
     }
 }
 ```
 
-The five signal weights should sum to `1.0` so the final score remains
-normalized to `[0, 1]`.
-
 | Parameter group | Effect |
 | --- | --- |
-| `*Weight` | Relative contribution of email, device, payment, IP, and time. |
-| `MergeThreshold` | Lower values increase recall and false-positive risk; higher values increase precision. |
-| `MissingValueScore` | Evidence assigned when a signal is unknown; weights are not renormalized. |
-| Email parameters | Control local/domain scoring and n-gram candidate generation. |
-| IP/time parameters | Control subnet and timestamp-distance similarity buckets. |
+| `Smoothing` | Prevents zero empirical probabilities and infinite log ratios. |
+| `LinkEvidenceThreshold` | Raw log-evidence required by complete-linkage; lower values favor recall. |
+| `*M` arrays | Semi-empirical `P(agreement level | same actor)` assumptions. |
+| Email/time boundaries | Define the small set of agreement buckets. |
+| IP prefixes | Define exact, high-subnet, and mid-subnet agreement. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-Changing blocking parameters affects which pairs are evaluated, but candidate
-membership still requires the similarity threshold and all constraint checks.
+The scorer estimates `u = P(level | different actor)` from deterministic sampled
+pairs in the initial account dataset. Missing values contribute no evidence.
+Changing blocking parameters affects candidates, but membership still requires
+the raw threshold and all constraint checks.
 
 ## Part 1: batch linking
 
@@ -101,4 +98,20 @@ The program immediately flushes one assignment line to stdout:
 Streaming initializes clusters once with the batch algorithm. Each new account
 uses the maintained indexes, evaluates every member of each candidate cluster,
 joins the strongest valid cluster, or creates a deterministic singleton without
-rerunning the full batch pipeline.
+rerunning the full batch pipeline. Fellegi-Sunter parameters remain fixed after
+initialization; only account and candidate indexes are updated.
+
+## Offline evaluation
+
+Ground truth is read only by the separate evaluation command:
+
+```bash
+go run ./cmd/evaluate \
+  --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
+  --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
+  --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
+  --threshold 1.0
+```
+
+It reports TP/FP/TN/FN, pairwise accuracy/precision/recall/F1, cluster counts,
+singletons, and constraint violations. `cmd/linker` never reads truth.

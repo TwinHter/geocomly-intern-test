@@ -23,7 +23,7 @@ type Cluster struct {
 
 type State struct {
 	config         similarity.Config
-	scorer         similarity.Scorer
+	scorer         *similarity.Scorer
 	constraints    *constraint.Set
 	accounts       []model.Account
 	accountByID    map[string]int
@@ -47,14 +47,14 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 		}
 	}
 
-	scorer := similarity.New(config)
+	scorer := similarity.New(config, ordered)
 	distinct := constraint.New(constraints)
 	index := newCandidateIndex(config)
 	pairs := make([]scoredPair, 0)
 	for i, account := range ordered {
 		for _, candidate := range index.candidates(account) {
-			score := scorer.Score(ordered[candidate], account)
-			if score >= config.MergeThreshold {
+			score := scorer.RawScore(ordered[candidate], account)
+			if score >= config.LinkEvidenceThreshold {
 				pairs = append(pairs, scoredPair{a: candidate, b: i, score: score})
 			}
 		}
@@ -77,7 +77,7 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 		if ra == rb {
 			continue
 		}
-		if canMerge(components.members[ra], components.members[rb], ordered, scorer, distinct, config.MergeThreshold) {
+		if canMerge(components.members[ra], components.members[rb], ordered, scorer, distinct, config.LinkEvidenceThreshold) {
 			components.union(ra, rb)
 		}
 	}
@@ -122,13 +122,13 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 	return state, nil
 }
 
-func canMerge(aMembers, bMembers []int, accounts []model.Account, scorer similarity.Scorer, constraints *constraint.Set, threshold float64) bool {
+func canMerge(aMembers, bMembers []int, accounts []model.Account, scorer *similarity.Scorer, constraints *constraint.Set, threshold float64) bool {
 	for _, ai := range aMembers {
 		for _, bi := range bMembers {
 			if constraints.VerifiedDistinct(accounts[ai].AccountID, accounts[bi].AccountID) {
 				return false
 			}
-			if scorer.Score(accounts[ai], accounts[bi]) < threshold {
+			if scorer.RawScore(accounts[ai], accounts[bi]) < threshold {
 				return false
 			}
 		}
@@ -199,10 +199,11 @@ func (s *State) clusterScore(account model.Account, cluster *Cluster) (float64, 
 		if s.constraints.VerifiedDistinct(account.AccountID, existing.AccountID) {
 			return 0, false
 		}
-		score := s.scorer.Score(account, existing)
-		if score < s.config.MergeThreshold {
+		evidence := s.scorer.PairEvidence(account, existing)
+		if evidence.Raw < s.config.LinkEvidenceThreshold {
 			return 0, false
 		}
+		score := evidence.Confidence
 		if score < minimum {
 			minimum = score
 		}

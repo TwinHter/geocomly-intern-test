@@ -1,7 +1,6 @@
 package linker
 
 import (
-	"net/netip"
 	"sort"
 	"strings"
 
@@ -101,16 +100,5 @@ func (idx *candidateIndex) collect(destination map[int]struct{}, posting []int) 
 }
 
 func (idx *candidateIndex) ipKeys(raw string) (exact, high, mid string) {
-	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
-	if err != nil {
-		return "", "", ""
-	}
-	addr = addr.Unmap()
-	highBits := idx.config.IPv6HighPrefixBits
-	midBits := idx.config.IPv6MidPrefixBits
-	if addr.Is4() {
-		highBits = idx.config.IPv4HighPrefixBits
-		midBits = idx.config.IPv4MidPrefixBits
-	}
-	return addr.String(), netip.PrefixFrom(addr, highBits).Masked().String(), netip.PrefixFrom(addr, midBits).Masked().String()
+	return similarity.IPKeys(raw, idx.config)
 }
