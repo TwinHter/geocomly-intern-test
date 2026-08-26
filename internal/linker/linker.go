@@ -23,7 +23,7 @@ type Cluster struct {
 
 type State struct {
 	config         similarity.Config
-	scorer         similarity.Scorer
+	scorer         *similarity.Scorer
 	constraints    *constraint.Set
 	accounts       []model.Account
 	accountByID    map[string]int
@@ -47,7 +47,7 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 		}
 	}
 
-	scorer := similarity.New(config)
+	scorer := similarity.New(config, ordered)
 	distinct := constraint.New(constraints)
 	index := newCandidateIndex(config)
 	pairs := make([]scoredPair, 0)
@@ -122,7 +122,7 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 	return state, nil
 }
 
-func canMerge(aMembers, bMembers []int, accounts []model.Account, scorer similarity.Scorer, constraints *constraint.Set, threshold float64) bool {
+func canMerge(aMembers, bMembers []int, accounts []model.Account, scorer *similarity.Scorer, constraints *constraint.Set, threshold float64) bool {
 	for _, ai := range aMembers {
 		for _, bi := range bMembers {
 			if constraints.VerifiedDistinct(accounts[ai].AccountID, accounts[bi].AccountID) {
@@ -184,6 +184,7 @@ func (s *State) Add(account model.Account) (model.StreamOutput, error) {
 	}
 	s.accountCluster[account.AccountID] = best.ID
 	s.index.add(account, accountIndex)
+	s.scorer.Add(account)
 
 	return model.StreamOutput{
 		AccountID:  account.AccountID,

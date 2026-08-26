@@ -2,77 +2,51 @@ package similarity
 
 import "time"
 
-// Config contains every tunable scoring, blocking, and confidence parameter.
+// Config contains every tunable scoring and blocking parameter.
 type Config struct {
-	EmailWeight   float64
-	DeviceWeight  float64
-	PaymentWeight float64
-	IPWeight      float64
-	TimeWeight    float64
-
-	MissingValueScore   float64
+	Smoothing           float64
+	EvidenceScale       float64
 	MergeThreshold      float64
 	SingletonConfidence float64
-
-	EmailLocalPartWeight  float64
-	EmailDomainPartWeight float64
-	EmailNGramSize        int
-	MinEmailNGramMatches  int
-	ShortEmailRuneLength  int
 
 	IPv4HighPrefixBits int
 	IPv4MidPrefixBits  int
 	IPv6HighPrefixBits int
 	IPv6MidPrefixBits  int
-	IPHighScore        float64
-	IPMidScore         float64
+	IPHighFactor       float64
+	IPMidFactor        float64
 
-	TimeVeryClose     time.Duration
-	TimeClose         time.Duration
-	TimeModerate      time.Duration
-	TimeFar           time.Duration
-	TimeCloseScore    float64
-	TimeModerateScore float64
-	TimeFarScore      float64
+	TimeEvidence float64
+	TimeDecay    time.Duration
 
-	MaxBlockSize  int
-	MaxCandidates int
+	EmailNGramSize       int
+	MinEmailNGramMatches int
+	ShortEmailRuneLength int
+	MaxBlockSize         int
+	MaxCandidates        int
 }
 
 func DefaultConfig() Config {
 	return Config{
-		EmailWeight:   0.50,
-		DeviceWeight:  0.175,
-		PaymentWeight: 0.175,
-		IPWeight:      0.10,
-		TimeWeight:    0.05,
-
-		MissingValueScore:   0.20,
-		MergeThreshold:      0.44,
-		SingletonConfidence: 1.0,
-
-		EmailLocalPartWeight:  0.85,
-		EmailDomainPartWeight: 0.15,
-		EmailNGramSize:        3,
-		MinEmailNGramMatches:  2,
-		ShortEmailRuneLength:  4,
+		Smoothing:           1,
+		EvidenceScale:       0.75,
+		MergeThreshold:      0.60,
+		SingletonConfidence: 1,
 
 		IPv4HighPrefixBits: 24,
 		IPv4MidPrefixBits:  16,
 		IPv6HighPrefixBits: 64,
 		IPv6MidPrefixBits:  48,
-		IPHighScore:        0.85,
-		IPMidScore:         0.55,
+		IPHighFactor:       0.60,
+		IPMidFactor:        0.25,
 
-		TimeVeryClose:     time.Hour,
-		TimeClose:         24 * time.Hour,
-		TimeModerate:      7 * 24 * time.Hour,
-		TimeFar:           30 * 24 * time.Hour,
-		TimeCloseScore:    0.80,
-		TimeModerateScore: 0.50,
-		TimeFarScore:      0.20,
+		TimeEvidence: 0.25,
+		TimeDecay:    7 * 24 * time.Hour,
 
-		MaxBlockSize:  256,
-		MaxCandidates: 4096,
+		EmailNGramSize:       3,
+		MinEmailNGramMatches: 2,
+		ShortEmailRuneLength: 4,
+		MaxBlockSize:         256,
+		MaxCandidates:        4096,
 	}
 }

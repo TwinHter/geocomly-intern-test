@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -35,10 +36,8 @@ func verifiedDistinct(a, b string) model.Constraint {
 
 func TestDefaultConfig(t *testing.T) {
 	config := similarity.DefaultConfig()
-	weightSum := config.EmailWeight + config.DeviceWeight + config.PaymentWeight +
-		config.IPWeight + config.TimeWeight
-	if math.Abs(weightSum-1) > 1e-9 {
-		t.Fatalf("weights sum to %.4f, want 1", weightSum)
+	if config.Smoothing <= 0 || config.EvidenceScale <= 0 {
+		t.Fatalf("invalid evidence config: %+v", config)
 	}
 	if config.MergeThreshold <= 0 || config.MergeThreshold > 1 {
 		t.Fatalf("invalid merge threshold %.4f", config.MergeThreshold)
@@ -56,7 +55,7 @@ func TestEmailSimilarity(t *testing.T) {
 		{name: "normalized exact", a: " User@Example.com ", b: "user@example.com", min: 1, max: 1},
 		{name: "plus alias", a: "user+checkout@example.com", b: "user@example.com", min: 1, max: 1},
 		{name: "small typo", a: "john.doe@gmail.com", b: "j0hn.doe@gmail.com", min: 0.85, max: 0.95},
-		{name: "different local", a: "alice@gmail.com", b: "robert@gmail.com", min: 0.10, max: 0.40},
+		{name: "different local", a: "alice@gmail.com", b: "robert@gmail.com", min: 0, max: 0.20},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -68,52 +67,56 @@ func TestEmailSimilarity(t *testing.T) {
 	}
 }
 
-func TestIPSimilarity(t *testing.T) {
-	scorer := similarity.New(similarity.DefaultConfig())
-	tests := []struct {
-		name string
-		a    string
-		b    string
-		want float64
-	}{
-		{name: "IPv4 exact", a: "203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "IPv4 /24", a: "203.0.113.4", b: "203.0.113.90", want: 0.85},
-		{name: "IPv4 /16", a: "203.0.113.4", b: "203.0.9.1", want: 0.55},
-		{name: "IPv4 different", a: "203.0.113.4", b: "198.51.100.1", want: 0},
-		{name: "IPv6 /64", a: "2001:db8:1:2::1", b: "2001:db8:1:2::99", want: 0.85},
-		{name: "IPv6 /48", a: "2001:db8:1:2::1", b: "2001:db8:1:9::1", want: 0.55},
-		{name: "IPv4 mapped", a: "::ffff:203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "missing", a: "", b: "203.0.113.4", want: 0.20},
+func TestRareExactValueProvidesMoreEvidence(t *testing.T) {
+	accounts := []model.Account{
+		{DeviceID: "rare"}, {DeviceID: "rare"},
+		{DeviceID: "common"}, {DeviceID: "common"}, {DeviceID: "common"}, {DeviceID: "common"},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := scorer.IPSimilarity(tt.a, tt.b); math.Abs(got-tt.want) > 1e-9 {
-				t.Fatalf("IPSimilarity() = %.4f, want %.4f", got, tt.want)
-			}
-		})
+	scorer := similarity.New(similarity.DefaultConfig(), accounts)
+	rare := scorer.PairEvidence(accounts[0], accounts[1]).Device
+	common := scorer.PairEvidence(accounts[2], accounts[3]).Device
+	wantRare := math.Log(8.0 / 3.0)
+	if math.Abs(rare-wantRare) > 1e-9 {
+		t.Fatalf("rare evidence = %.4f, want rarity %.4f", rare, wantRare)
+	}
+	if rare <= common {
+		t.Fatalf("rare evidence %.4f must exceed common evidence %.4f", rare, common)
+	}
+}
+
+func TestCommonIPDoesNotDominateScore(t *testing.T) {
+	accounts := make([]model.Account, 20)
+	for i := range accounts {
+		accounts[i].IP = fmt.Sprintf("203.0.113.%d", i+1)
+	}
+	scorer := similarity.New(similarity.DefaultConfig(), accounts)
+	if score := scorer.Score(accounts[0], accounts[1]); score >= similarity.DefaultConfig().MergeThreshold {
+		t.Fatalf("common /24 score %.4f reached merge threshold", score)
+	}
+}
+
+func TestIPEvidenceHierarchy(t *testing.T) {
+	accounts := []model.Account{
+		{IP: "203.0.113.4"}, {IP: "203.0.113.4"},
+		{IP: "203.0.113.90"}, {IP: "203.0.113.91"},
+		{IP: "203.0.9.1"}, {IP: "203.0.8.1"},
+	}
+	scorer := similarity.New(similarity.DefaultConfig(), accounts)
+	exact := scorer.PairEvidence(accounts[0], accounts[1]).IP
+	high := scorer.PairEvidence(accounts[0], accounts[2]).IP
+	mid := scorer.PairEvidence(accounts[0], accounts[4]).IP
+	different := scorer.PairEvidence(accounts[0], model.Account{IP: "198.51.100.1"}).IP
+	if !(exact > high && high > mid && mid > different) {
+		t.Fatalf("IP evidence hierarchy exact=%f /24=%f /16=%f different=%f", exact, high, mid, different)
 	}
 }
 
 func TestScoreMissingValuesAndBounds(t *testing.T) {
 	config := similarity.DefaultConfig()
-	scorer := similarity.New(config)
+	if got := similarity.New(config, nil).Score(model.Account{}, model.Account{}); got != 0 {
+		t.Fatalf("missing signals score = %.4f, want 0", got)
+	}
 	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	a := model.Account{Email: "same@example.com", CreatedAt: created}
-	want := config.EmailWeight + config.DeviceWeight*config.MissingValueScore +
-		config.PaymentWeight*config.MissingValueScore + config.IPWeight*config.MissingValueScore + config.TimeWeight
-	if got := scorer.Score(a, a); math.Abs(got-want) > 1e-9 {
-		t.Fatalf("Score() = %.4f, want %.4f", got, want)
-	}
-
-	config.EmailWeight = 1
-	config.DeviceWeight = 0
-	config.PaymentWeight = 0
-	config.IPWeight = 0
-	config.TimeWeight = 0
-	if got := similarity.New(config).Score(model.Account{}, model.Account{}); got != config.MissingValueScore {
-		t.Fatalf("missing email score = %.4f, want %.4f", got, config.MissingValueScore)
-	}
-
 	exact := model.Account{
 		Email:              "a@example.com",
 		DeviceID:           "d",
@@ -121,23 +124,52 @@ func TestScoreMissingValuesAndBounds(t *testing.T) {
 		IP:                 "192.0.2.1",
 		CreatedAt:          created,
 	}
-	if got := scorer.Score(exact, exact); got != 1 {
-		t.Fatalf("Score(exact, exact) = %.4f, want 1", got)
+	scorer := similarity.New(config, []model.Account{exact, exact})
+	evidence := scorer.PairEvidence(exact, exact)
+	if evidence.Raw <= 0 || evidence.Score <= 0 || evidence.Score >= 1 {
+		t.Fatalf("unexpected normalized evidence: %+v", evidence)
+	}
+	before := evidence.Device
+	scorer.Add(exact)
+	after := scorer.PairEvidence(exact, exact).Device
+	if after >= before {
+		t.Fatalf("device evidence did not weaken as value became more common: before=%f after=%f", before, after)
+	}
+	if first, second := scorer.Score(exact, exact), scorer.Score(exact, exact); first != second {
+		t.Fatalf("scoring is not deterministic: first=%f second=%f", first, second)
+	}
+}
+
+func TestStreamingUpdatesFrequencyState(t *testing.T) {
+	state, err := linker.Batch([]model.Account{testAccount("initial", "same@example.com")}, nil, similarity.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := state.Add(testAccount("new-1", "same@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := state.Add(testAccount("new-2", "same@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ClusterID != "c1" || second.ClusterID != "c1" {
+		t.Fatalf("streamed assignments left initial cluster: first=%+v second=%+v", first, second)
+	}
+	if second.Confidence >= first.Confidence {
+		t.Fatalf("frequency update did not weaken repeated evidence: first=%f second=%f", first.Confidence, second.Confidence)
 	}
 }
 
 func TestCompleteLinkageDoesNotUseNaiveTransitivity(t *testing.T) {
 	config := similarity.DefaultConfig()
-	config.EmailWeight = 1
-	config.DeviceWeight = 0
-	config.PaymentWeight = 0
-	config.IPWeight = 0
-	config.TimeWeight = 0
-	config.MergeThreshold = 0.70
+	config.EvidenceScale = 0.5
+	config.MergeThreshold = 0.68
+	config.MinEmailNGramMatches = 1
 	accounts := []model.Account{
-		testAccount("a", "aaaa@example.com"),
-		testAccount("b", "aaab@example.com"),
-		testAccount("c", "aabb@example.com"),
+		{AccountID: "a", Email: "aaaaa@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "aaaab@example.com", CreatedAt: testTime},
+		{AccountID: "c", Email: "aaabb@example.com", CreatedAt: testTime},
 	}
 	state, err := linker.Batch(accounts, nil, config)
 	if err != nil {

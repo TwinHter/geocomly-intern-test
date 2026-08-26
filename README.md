@@ -17,38 +17,37 @@ All tests are kept in `cmd/linker/main_test.go`.
 
 ## Hyperparameters
 
-All tunable values are centralized in `internal/similarity/config.go` inside
-`DefaultConfig()`. Edit that function, then rerun the tests and build.
+All tunable values for the frequency-aware experiment are in
+`internal/similarity/config.go`, inside `DefaultConfig()`. Edit that function,
+then rerun the tests and build.
 
 ```go
 func DefaultConfig() Config {
     return Config{
-        EmailWeight:        0.50,
-        DeviceWeight:       0.175,
-        PaymentWeight:      0.175,
-        IPWeight:           0.10,
-        TimeWeight:         0.05,
-        MissingValueScore:  0.20,
-        MergeThreshold:     0.44,
-        // Other email, IP, time, and blocking parameters follow.
+        Smoothing:      1,
+        EvidenceScale:  0.75,
+        MergeThreshold: 0.60,
+        IPHighFactor:   0.60,
+        IPMidFactor:    0.25,
+        TimeEvidence:   0.25,
+        // IP prefixes, time decay, and blocking limits follow.
     }
 }
 ```
 
-The five signal weights should sum to `1.0` so the final score remains
-normalized to `[0, 1]`.
-
 | Parameter group | Effect |
 | --- | --- |
-| `*Weight` | Relative contribution of email, device, payment, IP, and time. |
+| `Smoothing` | Stabilizes `-log` rarity estimates for small datasets. |
+| `EvidenceScale` | Controls the saturation mapping from raw evidence to `[0,1]`. |
 | `MergeThreshold` | Lower values increase recall and false-positive risk; higher values increase precision. |
-| `MissingValueScore` | Evidence assigned when a signal is unknown; weights are not renormalized. |
-| Email parameters | Control local/domain scoring and n-gram candidate generation. |
-| IP/time parameters | Control subnet and timestamp-distance similarity buckets. |
+| `IPHighFactor`, `IPMidFactor` | Make `/24` and `/16` evidence weaker than exact IP evidence. |
+| `TimeEvidence`, `TimeDecay` | Keep timestamp proximity as a small, smoothly decaying contribution. |
+| Email parameters | Control only n-gram candidate generation; email score strength comes from similarity and rarity. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-Changing blocking parameters affects which pairs are evaluated, but candidate
-membership still requires the similarity threshold and all constraint checks.
+Missing values contribute no evidence. There are no independent email, device,
+payment, IP, or time weights. Changing blocking parameters affects which pairs
+are evaluated, but membership still requires the threshold and all constraints.
 
 ## Part 1: batch linking
 
@@ -101,4 +100,29 @@ The program immediately flushes one assignment line to stdout:
 Streaming initializes clusters once with the batch algorithm. Each new account
 uses the maintained indexes, evaluates every member of each candidate cluster,
 joins the strongest valid cluster, or creates a deterministic singleton without
-rerunning the full batch pipeline.
+rerunning the full batch pipeline. It is scored against the current frequency
+state, then its values are added to the frequency tables after assignment.
+
+## Offline evaluation
+
+`cmd/evaluate` is separate from production linking and is the only command that
+reads ground truth. Evaluate an existing clusters file:
+
+```bash
+go run ./cmd/evaluate \
+  --clusters clusters.json \
+  --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json
+```
+
+For an offline threshold experiment, it can also run batch linking directly:
+
+```bash
+go run ./cmd/evaluate \
+  --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
+  --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
+  --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
+  --threshold 0.60
+```
+
+It reports TP, FP, TN, FN, pairwise accuracy/precision/recall/F1, predicted
+clusters, and singleton clusters. Truth is never used by `cmd/linker`.

@@ -1,6 +1,7 @@
 package similarity
 
 import (
+	"math"
 	"net/netip"
 	"sort"
 	"strings"
@@ -10,51 +11,164 @@ import (
 	"accountlinker/internal/model"
 )
 
+type frequencies struct {
+	total    int
+	emails   map[string]int
+	devices  map[string]int
+	payments map[string]int
+	ipExact  map[string]int
+	ipHigh   map[string]int
+	ipMid    map[string]int
+}
+
+// Evidence exposes the normalized score and its raw field contributions.
+type Evidence struct {
+	Raw     float64
+	Score   float64
+	Email   float64
+	Device  float64
+	Payment float64
+	IP      float64
+	Time    float64
+}
+
 type Scorer struct {
 	Config Config
+	stats  frequencies
 }
 
-func New(config Config) Scorer {
-	return Scorer{Config: config}
+func New(config Config, accounts []model.Account) *Scorer {
+	scorer := &Scorer{
+		Config: config,
+		stats: frequencies{
+			emails:   make(map[string]int),
+			devices:  make(map[string]int),
+			payments: make(map[string]int),
+			ipExact:  make(map[string]int),
+			ipHigh:   make(map[string]int),
+			ipMid:    make(map[string]int),
+		},
+	}
+	for _, account := range accounts {
+		scorer.Add(account)
+	}
+	return scorer
 }
 
-func (s Scorer) Score(a, b model.Account) float64 {
-	score := s.Config.EmailWeight*s.emailSimilarity(a.Email, b.Email) +
-		s.Config.DeviceWeight*s.exactOrMissing(a.DeviceID, b.DeviceID) +
-		s.Config.PaymentWeight*s.exactOrMissing(a.PaymentFingerprint, b.PaymentFingerprint) +
-		s.Config.IPWeight*s.IPSimilarity(a.IP, b.IP) +
-		s.Config.TimeWeight*s.TimeSimilarity(a.CreatedAt, b.CreatedAt)
-	if score < 0 {
+// Add updates frequency state after a streamed account has been assigned.
+func (s *Scorer) Add(account model.Account) {
+	s.stats.total++
+	increment(s.stats.emails, NormalizeEmail(account.Email))
+	increment(s.stats.devices, strings.TrimSpace(account.DeviceID))
+	increment(s.stats.payments, strings.TrimSpace(account.PaymentFingerprint))
+	exact, high, mid := IPKeys(account.IP, s.Config)
+	increment(s.stats.ipExact, exact)
+	increment(s.stats.ipHigh, high)
+	increment(s.stats.ipMid, mid)
+}
+
+func increment(counts map[string]int, value string) {
+	if value != "" {
+		counts[value]++
+	}
+}
+
+func (s *Scorer) Score(a, b model.Account) float64 {
+	return s.PairEvidence(a, b).Score
+}
+
+func (s *Scorer) PairEvidence(a, b model.Account) Evidence {
+	result := Evidence{
+		Email:   s.emailEvidence(a.Email, b.Email),
+		Device:  s.exactEvidence(a.DeviceID, b.DeviceID, s.stats.devices),
+		Payment: s.exactEvidence(a.PaymentFingerprint, b.PaymentFingerprint, s.stats.payments),
+		IP:      s.ipEvidence(a.IP, b.IP),
+		Time:    s.timeEvidence(a.CreatedAt, b.CreatedAt),
+	}
+	result.Raw = result.Email + result.Device + result.Payment + result.IP + result.Time
+	maxRarity := s.maximumRarity()
+	if s.Config.EvidenceScale > 0 && maxRarity > 0 {
+		result.Score = 1 - math.Exp(-result.Raw/(s.Config.EvidenceScale*maxRarity))
+	}
+	return result
+}
+
+func (s *Scorer) maximumRarity() float64 {
+	if s.stats.total == 0 {
 		return 0
 	}
-	if score > 1 {
-		return 1
+	smoothing := s.Config.Smoothing
+	if smoothing <= 0 {
+		smoothing = 1
 	}
-	return score
+	return math.Log((float64(s.stats.total) + 2*smoothing) / smoothing)
 }
 
-func (s Scorer) emailSimilarity(a, b string) float64 {
-	if NormalizeEmail(a) == "" || NormalizeEmail(b) == "" {
-		return s.Config.MissingValueScore
+func (s *Scorer) rarity(counts map[string]int, value string) float64 {
+	if value == "" || s.stats.total == 0 {
+		return 0
 	}
-	return weightedEmailSimilarity(
-		a,
-		b,
-		s.Config.EmailLocalPartWeight,
-		s.Config.EmailDomainPartWeight,
-	)
+	smoothing := s.Config.Smoothing
+	if smoothing <= 0 {
+		smoothing = 1
+	}
+	probability := (float64(counts[value]) + smoothing) /
+		(float64(s.stats.total) + 2*smoothing)
+	if probability >= 1 {
+		return 0
+	}
+	return -math.Log(probability)
 }
 
-func (s Scorer) exactOrMissing(a, b string) float64 {
+func (s *Scorer) emailEvidence(a, b string) float64 {
+	a = NormalizeEmail(a)
+	b = NormalizeEmail(b)
+	if a == "" || b == "" {
+		return 0
+	}
+	rarity := math.Min(s.rarity(s.stats.emails, a), s.rarity(s.stats.emails, b))
+	if a == b {
+		return rarity
+	}
+	return normalizedLevenshtein(EmailLocal(a), EmailLocal(b)) * rarity
+}
+
+func (s *Scorer) exactEvidence(a, b string, counts map[string]int) float64 {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
-		return s.Config.MissingValueScore
+	if a == "" || a != b {
+		return 0
 	}
-	if a == b {
-		return 1
+	return s.rarity(counts, a)
+}
+
+func (s *Scorer) ipEvidence(a, b string) float64 {
+	aExact, aHigh, aMid := IPKeys(a, s.Config)
+	bExact, bHigh, bMid := IPKeys(b, s.Config)
+	if aExact == "" || bExact == "" {
+		return 0
+	}
+	if aExact == bExact {
+		return s.rarity(s.stats.ipExact, aExact)
+	}
+	if aHigh == bHigh {
+		return s.Config.IPHighFactor * s.rarity(s.stats.ipHigh, aHigh)
+	}
+	if aMid == bMid {
+		return s.Config.IPMidFactor * s.rarity(s.stats.ipMid, aMid)
 	}
 	return 0
+}
+
+func (s *Scorer) timeEvidence(a, b time.Time) float64 {
+	if a.IsZero() || b.IsZero() || s.Config.TimeDecay <= 0 {
+		return 0
+	}
+	delta := a.Sub(b)
+	if delta < 0 {
+		delta = -delta
+	}
+	return s.Config.TimeEvidence / (1 + float64(delta)/float64(s.Config.TimeDecay))
 }
 
 func NormalizeEmail(email string) string {
@@ -79,26 +193,12 @@ func EmailLocal(email string) string {
 }
 
 func EmailSimilarity(a, b string) float64 {
-	config := DefaultConfig()
-	return weightedEmailSimilarity(a, b, config.EmailLocalPartWeight, config.EmailDomainPartWeight)
-}
-
-func weightedEmailSimilarity(a, b string, localWeight, domainWeight float64) float64 {
 	a = NormalizeEmail(a)
 	b = NormalizeEmail(b)
-	if a == "" || b == "" {
-		return 0
-	}
 	if a == b {
 		return 1
 	}
-	aLocal, aDomain, aFound := strings.Cut(a, "@")
-	bLocal, bDomain, bFound := strings.Cut(b, "@")
-	if !aFound || !bFound {
-		return normalizedLevenshtein(a, b)
-	}
-	return localWeight*normalizedLevenshtein(aLocal, bLocal) +
-		domainWeight*normalizedLevenshtein(aDomain, bDomain)
+	return normalizedLevenshtein(EmailLocal(a), EmailLocal(b))
 }
 
 func normalizedLevenshtein(a, b string) float64 {
@@ -151,60 +251,19 @@ func min3(a, b, c int) int {
 	return c
 }
 
-func (s Scorer) IPSimilarity(a, b string) float64 {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
-		return s.Config.MissingValueScore
+func IPKeys(raw string, config Config) (exact, high, mid string) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return "", "", ""
 	}
-	addrA, errA := netip.ParseAddr(a)
-	addrB, errB := netip.ParseAddr(b)
-	if errA != nil || errB != nil {
-		return 0
+	addr = addr.Unmap()
+	highBits := config.IPv6HighPrefixBits
+	midBits := config.IPv6MidPrefixBits
+	if addr.Is4() {
+		highBits = config.IPv4HighPrefixBits
+		midBits = config.IPv4MidPrefixBits
 	}
-	addrA = addrA.Unmap()
-	addrB = addrB.Unmap()
-	if addrA.Is4() != addrB.Is4() {
-		return 0
-	}
-	if addrA == addrB {
-		return 1
-	}
-	highBits := s.Config.IPv6HighPrefixBits
-	midBits := s.Config.IPv6MidPrefixBits
-	if addrA.Is4() {
-		highBits = s.Config.IPv4HighPrefixBits
-		midBits = s.Config.IPv4MidPrefixBits
-	}
-	if netip.PrefixFrom(addrA, highBits).Masked() == netip.PrefixFrom(addrB, highBits).Masked() {
-		return s.Config.IPHighScore
-	}
-	if netip.PrefixFrom(addrA, midBits).Masked() == netip.PrefixFrom(addrB, midBits).Masked() {
-		return s.Config.IPMidScore
-	}
-	return 0
-}
-
-func (s Scorer) TimeSimilarity(a, b time.Time) float64 {
-	if a.IsZero() || b.IsZero() {
-		return s.Config.MissingValueScore
-	}
-	delta := a.Sub(b)
-	if delta < 0 {
-		delta = -delta
-	}
-	switch {
-	case delta <= s.Config.TimeVeryClose:
-		return 1
-	case delta <= s.Config.TimeClose:
-		return s.Config.TimeCloseScore
-	case delta <= s.Config.TimeModerate:
-		return s.Config.TimeModerateScore
-	case delta <= s.Config.TimeFar:
-		return s.Config.TimeFarScore
-	default:
-		return 0
-	}
+	return addr.String(), netip.PrefixFrom(addr, highBits).Masked().String(), netip.PrefixFrom(addr, midBits).Masked().String()
 }
 
 func EmailNGrams(email string, size int) []string {
@@ -221,8 +280,8 @@ func EmailNGrams(email string, size int) []string {
 		seen[string(runes[i:i+size])] = struct{}{}
 	}
 	result := make([]string, 0, len(seen))
-	for trigram := range seen {
-		result = append(result, trigram)
+	for ngram := range seen {
+		result = append(result, ngram)
 	}
 	sort.Strings(result)
 	return result
