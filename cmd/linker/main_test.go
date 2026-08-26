@@ -43,6 +43,9 @@ func TestDefaultConfig(t *testing.T) {
 	if config.MergeThreshold <= 0 || config.MergeThreshold > 1 {
 		t.Fatalf("invalid merge threshold %.4f", config.MergeThreshold)
 	}
+	if config.NeutralSimilarity <= 0 || config.NeutralSimilarity >= 1 {
+		t.Fatalf("invalid neutral similarity %.4f", config.NeutralSimilarity)
+	}
 }
 
 func TestEmailSimilarity(t *testing.T) {
@@ -126,32 +129,82 @@ func TestScoreMissingValuesAndBounds(t *testing.T) {
 	}
 }
 
-func TestCompleteLinkageDoesNotUseNaiveTransitivity(t *testing.T) {
-	config := similarity.DefaultConfig()
-	config.EmailWeight = 1
-	config.DeviceWeight = 0
-	config.PaymentWeight = 0
-	config.IPWeight = 0
-	config.TimeWeight = 0
-	config.MergeThreshold = 0.70
-	accounts := []model.Account{
-		testAccount("a", "aaaa@example.com"),
-		testAccount("b", "aaab@example.com"),
-		testAccount("c", "aabb@example.com"),
+func TestSignedEdgeConversion(t *testing.T) {
+	if got := linker.SignedEdge(0.75, 0.40); math.Abs(got-0.35) > 1e-9 {
+		t.Fatalf("positive signed edge = %.4f, want .35", got)
 	}
-	state, err := linker.Batch(accounts, nil, config)
-	if err != nil {
-		t.Fatal(err)
+	if got := linker.SignedEdge(0.20, 0.40); math.Abs(got+0.20) > 1e-9 {
+		t.Fatalf("negative signed edge = %.4f, want -.20", got)
 	}
-	output := state.Output()
-	if len(output.Clusters) != 2 {
-		t.Fatalf("got %d clusters, want 2: %+v", len(output.Clusters), output.Clusters)
+}
+
+func TestAgglomerativePositiveAndNegativeGain(t *testing.T) {
+	positive := [][]float64{{0, 0.4}, {0.4, 0}}
+	groups, steps := linker.Agglomerate(positive, boolMatrix(2))
+	if len(groups) != 1 || len(steps) != 1 || steps[0].Gain != 0.4 {
+		t.Fatalf("positive edge did not merge: groups=%v steps=%+v", groups, steps)
 	}
-	for _, cluster := range output.Clusters {
-		if len(cluster.AccountIDs) == 3 {
-			t.Fatalf("incompatible endpoints merged transitively: %+v", cluster)
+
+	negative := [][]float64{{0, -0.1}, {-0.1, 0}}
+	groups, steps = linker.Agglomerate(negative, boolMatrix(2))
+	if len(groups) != 2 || len(steps) != 0 {
+		t.Fatalf("negative edge merged: groups=%v steps=%+v", groups, steps)
+	}
+}
+
+func TestAgglomerativeBestLegalMergeAndHardConstraint(t *testing.T) {
+	edges := [][]float64{
+		{0, 0.4, 0.8},
+		{0.4, 0, -0.5},
+		{0.8, -0.5, 0},
+	}
+	blocked := boolMatrix(3)
+	blocked[0][2], blocked[2][0] = true, true
+	groups, steps := linker.Agglomerate(edges, blocked)
+	if len(steps) == 0 || steps[0].LeftKey != 0 || steps[0].RightKey != 1 {
+		t.Fatalf("best blocked merge prevented valid fallback: groups=%v steps=%+v", groups, steps)
+	}
+	for _, group := range groups {
+		if containsInt(group, 0) && containsInt(group, 2) {
+			t.Fatalf("hard-constrained nodes merged: %v", groups)
 		}
 	}
+}
+
+func containsInt(values []int, target int) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAgglomerativeTieBreakAndMonotonicObjective(t *testing.T) {
+	edges := [][]float64{
+		{0, 0.5, 0.5},
+		{0.5, 0, 0.2},
+		{0.5, 0.2, 0},
+	}
+	_, steps := linker.Agglomerate(edges, boolMatrix(3))
+	if len(steps) == 0 || steps[0].LeftKey != 0 || steps[0].RightKey != 1 {
+		t.Fatalf("unexpected deterministic tie-break: %+v", steps)
+	}
+	previous := 0.0
+	for _, step := range steps {
+		if step.Gain <= 0 || step.Objective <= previous {
+			t.Fatalf("accepted merge did not improve objective: %+v", steps)
+		}
+		previous = step.Objective
+	}
+}
+
+func boolMatrix(size int) [][]bool {
+	result := make([][]bool, size)
+	for i := range result {
+		result[i] = make([]bool, size)
+	}
+	return result
 }
 
 func TestVerifiedDistinctOverridesIdenticalSignals(t *testing.T) {
@@ -236,6 +289,53 @@ func TestStreamingChecksEveryClusterMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	if assignment.ClusterID != "c2" {
+		t.Fatalf("assignment = %+v, want singleton c2", assignment)
+	}
+}
+
+func TestStreamingChoosesHighestLegalPositiveGain(t *testing.T) {
+	a := model.Account{
+		AccountID: "a", Email: "match@example.com", DeviceID: "d1",
+		PaymentFingerprint: "p1", IP: "192.0.2.1", CreatedAt: testTime,
+	}
+	b := model.Account{
+		AccountID: "b", Email: "other@example.com", DeviceID: "d2",
+		PaymentFingerprint: "p2", IP: "192.0.2.2", CreatedAt: testTime,
+	}
+	state, err := linker.Batch([]model.Account{a, b}, []model.Constraint{verifiedDistinct("a", "b")}, similarity.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := a
+	incoming.AccountID = "new"
+	incoming.IP = "192.0.2.3"
+	assignment, err := state.Add(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ClusterID != "c1" {
+		t.Fatalf("assignment = %+v, want highest-gain cluster c1", assignment)
+	}
+}
+
+func TestStreamingCreatesSingletonForNonPositiveGain(t *testing.T) {
+	initial := model.Account{
+		AccountID: "a", Email: "alice@example.com", DeviceID: "d1",
+		PaymentFingerprint: "p1", IP: "192.0.2.1", CreatedAt: testTime,
+	}
+	state, err := linker.Batch([]model.Account{initial}, nil, similarity.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming := model.Account{
+		AccountID: "new", Email: "robert@example.com", DeviceID: "d2",
+		PaymentFingerprint: "p2", IP: "192.0.9.1", CreatedAt: testTime.Add(365 * 24 * time.Hour),
+	}
+	assignment, err := state.Add(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ClusterID != "c2" || assignment.Confidence != 1 {
 		t.Fatalf("assignment = %+v, want singleton c2", assignment)
 	}
 }

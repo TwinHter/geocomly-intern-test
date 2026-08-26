@@ -12,6 +12,7 @@ type Config struct {
 
 	MissingValueScore   float64
 	MergeThreshold      float64
+	NeutralSimilarity   float64
 	SingletonConfidence float64
 
 	EmailLocalPartWeight  float64
@@ -49,6 +50,7 @@ func DefaultConfig() Config {
 
 		MissingValueScore:   0.20,
 		MergeThreshold:      0.44,
+		NeutralSimilarity:   0.45,
 		SingletonConfidence: 1.0,
 
 		EmailLocalPartWeight:  0.85,

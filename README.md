@@ -30,6 +30,7 @@ func DefaultConfig() Config {
         TimeWeight:         0.05,
         MissingValueScore:  0.20,
         MergeThreshold:     0.44,
+        NeutralSimilarity:  0.45,
         // Other email, IP, time, and blocking parameters follow.
     }
 }
@@ -41,14 +42,16 @@ normalized to `[0, 1]`.
 | Parameter group | Effect |
 | --- | --- |
 | `*Weight` | Relative contribution of email, device, payment, IP, and time. |
-| `MergeThreshold` | Lower values increase recall and false-positive risk; higher values increase precision. |
+| `MergeThreshold` | Retained baseline setting; correlation decisions do not use it. |
+| `NeutralSimilarity` | Centers baseline similarity into signed correlation edges. |
 | `MissingValueScore` | Evidence assigned when a signal is unknown; weights are not renormalized. |
 | Email parameters | Control local/domain scoring and n-gram candidate generation. |
 | IP/time parameters | Control subnet and timestamp-distance similarity buckets. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-Changing blocking parameters affects which pairs are evaluated, but candidate
-membership still requires the similarity threshold and all constraint checks.
+`NeutralSimilarity` is the only parameter added by this experiment. Baseline
+field scoring remains unchanged. Blocking parameters affect streaming candidate
+generation; batch correlation clustering precomputes all pair scores.
 
 ## Part 1: batch linking
 
@@ -73,8 +76,9 @@ The output is one JSON document:
 }
 ```
 
-Every input account appears exactly once. A merge is accepted only when every
-cross-cluster pair reaches the threshold and no pair is `verified_distinct`.
+Every input account appears exactly once. Batch starts from singletons and
+repeatedly accepts the legal cluster merge with the largest positive sum of
+cross-cluster signed edges. `verified_distinct` always forbids a merge.
 
 ## Part 2: incremental streaming
 
@@ -99,6 +103,21 @@ The program immediately flushes one assignment line to stdout:
 ```
 
 Streaming initializes clusters once with the batch algorithm. Each new account
-uses the maintained indexes, evaluates every member of each candidate cluster,
-joins the strongest valid cluster, or creates a deterministic singleton without
-rerunning the full batch pipeline.
+uses the maintained indexes and joins the legal candidate cluster with the
+largest positive insertion gain, or creates a deterministic singleton. It does
+not globally recluster historical accounts.
+
+## Offline evaluation
+
+Ground truth is read only by the separate evaluator:
+
+```bash
+go run ./cmd/evaluate \
+  --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
+  --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
+  --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
+  --neutral 0.45
+```
+
+It reports TP/FP/TN/FN, pairwise metrics, clusters, singletons, and constraint
+violations. `cmd/linker` never reads truth.

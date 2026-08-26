@@ -10,20 +10,20 @@
 
 ## Algorithm choice
 
-The score is a fixed weighted sum: email `0.50`, device `0.175`, payment fingerprint `0.175`, IP `0.10`, and creation time `0.05`, with a merge threshold of `0.44`. Email is lowercased, trimmed, stripped of a `+tag`, then compared with rune-aware Levenshtein similarity split `85%` local part and `15%` domain. IP scores exact, same IPv4 `/24` or IPv6 `/64`, and same IPv4 `/16` or IPv6 `/48`; time uses configurable distance buckets. All tunable values live in `internal/similarity/config.go`.
+The baseline weighted pair scorer is unchanged. Its `[0,1]` compatibility becomes a signed graph edge with `score - 0.45`; positive edges favor co-clustering and negative edges favor separation. Batch precomputes every pair score, starts from singleton clusters, and repeatedly merges the legal cluster pair with the highest positive sum of cross-cluster edges. Maximizing internal signed weight is equivalent to the correlation objective up to a constant, and every accepted merge increases it by the reported gain.
 
-Batch mode generates blocked candidate pairs, sorts passing pairs by score and account ID, and uses DSU only for component bookkeeping. A union occurs only if every cross-component pair meets the threshold and no pair is `verified_distinct`. Rejected merges do not stop later candidates. This conservative complete-linkage rule limits false-positive blast radius while still favoring the assignment's higher false-negative cost through fuzzy email and subnet candidates.
+Merge gains and cannot-link state are cached and updated additively. `verified_distinct` is a hard invalid merge rather than a large negative edge; a blocked best pair does not stop another legal merge. Node/account order provides deterministic tie-breaking. I skipped local search to keep this experiment focused and maintainable.
 
 ## Engineering design
 
-Exact email, device, payment, IP, subnet, and email-trigram indexes feed both batch and streaming paths; indexes never decide membership. Large blocks are capped at 256 entries and each event at 4,096 candidate accounts to protect latency from shared hubs. Streaming evaluates candidate clusters incrementally, skips any conflicting cluster, chooses the highest minimum member score, preserves existing IDs, and creates sequential IDs for singletons.
+Batch stores an `O(N^2)` edge matrix and uses a clear `O(N^3)` agglomerative scan, appropriate for the small experiment dataset but not millions of accounts. Streaming remains incremental: indexes identify candidate clusters, insertion gain is the sum of signed edges to all cluster members, constrained clusters are skipped, and unrelated historical accounts are never reclustered. This is an online approximation of the batch objective.
 
-At 1M accounts, in-memory indexes and pair storage are the first pressure points. At 10M, DSU state, candidate postings, and complete cross-component checks need partitioning or durable storage. Cluster confidence is also quadratic in cluster size when batch output is written.
+At 1M accounts, the pair matrix fails first; a production version would require sparse candidate edges, a priority queue, and partitioned clustering. Cluster confidence is the average internal baseline similarity and remains quadratic in cluster size when output is written.
 
 ## Operating point
 
-On the provided sample, a 408-configuration pairwise sweep improved the baseline from accuracy/precision/recall/F1 of `99.5354%/100%/28.125%/43.9024%` to `99.6364%/88.8889%/50%/64%`. The selected `0.44` threshold and email-heavy weights favor recall because missed fraud rings are much more expensive, while complete linkage and verified-distinct checks limit false-positive propagation. These sample metrics are diagnostic rather than evidence of generalization. If false positives became much more expensive, I would raise the threshold, lower IP/time weights, and require two non-missing strong signals.
+The `main` baseline produced TP/FP/TN/FN `16/2/4916/16` and accuracy/precision/recall/F1 `99.6364%/88.8889%/50%/64%`. A neutral-similarity sweep from `0.30` to `0.60` selected `0.45`: `16/3/4915/16` and `99.6162%/84.2105%/50%/62.7451%`. The global heuristic does not beat the conservative baseline on this sample; it adds one false-positive pair without recovering a positive pair. If false positives became more expensive, I would increase the neutral point.
 
 ## Next steps
 
-With another day I would tune on held-out synthetic corruptions, add frequency-aware signal weights, benchmark million-record workloads, cache pair scores, improve Unicode/confusable email normalization, and replace hard candidate caps with deterministic rarest-block selection.
+With another day I would add deterministic single-node local refinement, test sparse-edge variants on larger held-out data, and benchmark a priority-queue gain cache. The key limitation is that dense agglomeration is cubic and greedy merges cannot be undone.
