@@ -23,13 +23,14 @@ All tunable values are centralized in `internal/similarity/config.go` inside
 ```go
 func DefaultConfig() Config {
     return Config{
-        EmailWeight:        0.50,
-        DeviceWeight:       0.175,
-        PaymentWeight:      0.175,
-        IPWeight:           0.10,
-        TimeWeight:         0.05,
-        MissingValueScore:  0.20,
-        MergeThreshold:     0.44,
+        EmailWeight:         0.40,
+        DeviceWeight:        0.25,
+        PaymentWeight:       0.25,
+        IPWeight:            0.08,
+        TimeWeight:          0.02,
+        MergeThreshold:      0.45,
+        StrongPairThreshold: 0.80,
+        LinkageRule:         CompleteLinkage,
         // Other email, IP, time, and blocking parameters follow.
     }
 }
@@ -42,13 +43,14 @@ normalized to `[0, 1]`.
 | --- | --- |
 | `*Weight` | Relative contribution of email, device, payment, IP, and time. |
 | `MergeThreshold` | Lower values increase recall and false-positive risk; higher values increase precision. |
-| `MissingValueScore` | Evidence assigned when a signal is unknown; weights are not renormalized. |
-| Email parameters | Control local/domain scoring and n-gram candidate generation. |
+| `StrongPairThreshold`, `LinkageRule` | Configure the optional average-linkage experiment. |
+| Email parameters | Control local-part fuzzy scoring, exact-domain bonus, and streaming n-grams. |
 | IP/time parameters | Control subnet and timestamp-distance similarity buckets. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-Changing blocking parameters affects which pairs are evaluated, but candidate
-membership still requires the similarity threshold and all constraint checks.
+Missing fields add no evidence. The weighted score is divided by the weights of
+fields present in both records; timestamp alone is not an identity signal.
+Batch scores all unordered pairs. Blocking parameters affect only streaming.
 
 ## Part 1: batch linking
 
@@ -73,8 +75,9 @@ The output is one JSON document:
 }
 ```
 
-Every input account appears exactly once. A merge is accepted only when every
-cross-cluster pair reaches the threshold and no pair is `verified_distinct`.
+Every input account appears exactly once. Batch scores all pairs, then complete
+linkage requires every cross-cluster pair to reach the threshold and rejects
+every `verified_distinct` merge.
 
 ## Part 2: incremental streaming
 
@@ -102,3 +105,18 @@ Streaming initializes clusters once with the batch algorithm. Each new account
 uses the maintained indexes, evaluates every member of each candidate cluster,
 joins the strongest valid cluster, or creates a deterministic singleton without
 rerunning the full batch pipeline.
+
+## Offline evaluation
+
+Ground truth is used only by the separate evaluator:
+
+```bash
+go run ./cmd/evaluate \
+  --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
+  --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
+  --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
+  --linkage complete --threshold 0.45
+```
+
+It reports pairwise metrics, F2, fraud-ring recovery, affected legitimate
+actors, business cost, constraint violations, and streaming candidate recall.

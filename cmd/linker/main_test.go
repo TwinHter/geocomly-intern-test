@@ -43,6 +43,12 @@ func TestDefaultConfig(t *testing.T) {
 	if config.MergeThreshold <= 0 || config.MergeThreshold > 1 {
 		t.Fatalf("invalid merge threshold %.4f", config.MergeThreshold)
 	}
+	if config.LinkageRule != similarity.CompleteLinkage {
+		t.Fatalf("default linkage = %q, want complete", config.LinkageRule)
+	}
+	if config.StrongPairThreshold < config.MergeThreshold || config.StrongPairThreshold > 1 {
+		t.Fatalf("invalid strong-pair threshold %.4f", config.StrongPairThreshold)
+	}
 }
 
 func TestEmailSimilarity(t *testing.T) {
@@ -56,7 +62,8 @@ func TestEmailSimilarity(t *testing.T) {
 		{name: "normalized exact", a: " User@Example.com ", b: "user@example.com", min: 1, max: 1},
 		{name: "plus alias", a: "user+checkout@example.com", b: "user@example.com", min: 1, max: 1},
 		{name: "small typo", a: "john.doe@gmail.com", b: "j0hn.doe@gmail.com", min: 0.85, max: 0.95},
-		{name: "different local", a: "alice@gmail.com", b: "robert@gmail.com", min: 0.10, max: 0.40},
+		{name: "common domain is weak", a: "alice@gmail.com", b: "robert@gmail.com", min: 0, max: 0.10},
+		{name: "domain is not fuzzy matched", a: "alice@gmail.com", b: "alice@hotmail.com", min: 0.80, max: 0.85},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,13 +84,13 @@ func TestIPSimilarity(t *testing.T) {
 		want float64
 	}{
 		{name: "IPv4 exact", a: "203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "IPv4 /24", a: "203.0.113.4", b: "203.0.113.90", want: 0.85},
-		{name: "IPv4 /16", a: "203.0.113.4", b: "203.0.9.1", want: 0.55},
+		{name: "IPv4 /24", a: "203.0.113.4", b: "203.0.113.90", want: 0.45},
+		{name: "IPv4 /16", a: "203.0.113.4", b: "203.0.9.1", want: 0.15},
 		{name: "IPv4 different", a: "203.0.113.4", b: "198.51.100.1", want: 0},
-		{name: "IPv6 /64", a: "2001:db8:1:2::1", b: "2001:db8:1:2::99", want: 0.85},
-		{name: "IPv6 /48", a: "2001:db8:1:2::1", b: "2001:db8:1:9::1", want: 0.55},
+		{name: "IPv6 /64", a: "2001:db8:1:2::1", b: "2001:db8:1:2::99", want: 0.45},
+		{name: "IPv6 /48", a: "2001:db8:1:2::1", b: "2001:db8:1:9::1", want: 0.15},
 		{name: "IPv4 mapped", a: "::ffff:203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "missing", a: "", b: "203.0.113.4", want: 0.20},
+		{name: "missing", a: "", b: "203.0.113.4", want: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -94,24 +101,29 @@ func TestIPSimilarity(t *testing.T) {
 	}
 }
 
-func TestScoreMissingValuesAndBounds(t *testing.T) {
+func TestScoreIgnoresMissingValuesAndRenormalizes(t *testing.T) {
 	config := similarity.DefaultConfig()
 	scorer := similarity.New(config)
 	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	a := model.Account{Email: "same@example.com", CreatedAt: created}
-	want := config.EmailWeight + config.DeviceWeight*config.MissingValueScore +
-		config.PaymentWeight*config.MissingValueScore + config.IPWeight*config.MissingValueScore + config.TimeWeight
-	if got := scorer.Score(a, a); math.Abs(got-want) > 1e-9 {
-		t.Fatalf("Score() = %.4f, want %.4f", got, want)
+	if got := scorer.Score(a, a); got != 1 {
+		t.Fatalf("exact available fields score = %.4f, want 1", got)
 	}
 
-	config.EmailWeight = 1
-	config.DeviceWeight = 0
-	config.PaymentWeight = 0
-	config.IPWeight = 0
-	config.TimeWeight = 0
-	if got := similarity.New(config).Score(model.Account{}, model.Account{}); got != config.MissingValueScore {
-		t.Fatalf("missing email score = %.4f, want %.4f", got, config.MissingValueScore)
+	if got := scorer.Score(model.Account{}, model.Account{}); got != 0 {
+		t.Fatalf("all-missing score = %.4f, want 0", got)
+	}
+	if got := scorer.Score(
+		model.Account{CreatedAt: created},
+		model.Account{CreatedAt: created},
+	); got != 0 {
+		t.Fatalf("timestamp-only score = %.4f, want 0", got)
+	}
+	if got := scorer.Score(
+		model.Account{Email: "same@example.com"},
+		model.Account{Email: ""},
+	); got != 0 {
+		t.Fatalf("one missing email score = %.4f, want 0", got)
 	}
 
 	exact := model.Account{
@@ -123,6 +135,73 @@ func TestScoreMissingValuesAndBounds(t *testing.T) {
 	}
 	if got := scorer.Score(exact, exact); got != 1 {
 		t.Fatalf("Score(exact, exact) = %.4f, want 1", got)
+	}
+}
+
+func TestBatchScoresAllPairsButStreamingUsesCandidates(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.EmailWeight = 1
+	config.DeviceWeight = 0
+	config.PaymentWeight = 0
+	config.IPWeight = 0
+	config.TimeWeight = 0
+	config.MergeThreshold = 0.75
+	config.StrongPairThreshold = 0.80
+	accounts := []model.Account{
+		{AccountID: "a", Email: "abcde@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "abxde@example.com", CreatedAt: testTime},
+	}
+	state, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(state.Output().Clusters); got != 1 {
+		t.Fatalf("all-pairs batch produced %d clusters, want 1", got)
+	}
+
+	streamState, err := linker.Batch(accounts[:1], nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment, err := streamState.Add(accounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ClusterID == "c1" {
+		t.Fatal("streaming unexpectedly found a pair with no shared block")
+	}
+}
+
+func TestAverageStrongLinkageCanAcceptModerateAverage(t *testing.T) {
+	accounts := []model.Account{
+		{AccountID: "a", Email: "aaaa@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "aaab@example.com", CreatedAt: testTime},
+		{AccountID: "c", Email: "aabb@example.com", CreatedAt: testTime},
+	}
+	config := similarity.DefaultConfig()
+	config.EmailWeight = 1
+	config.DeviceWeight = 0
+	config.PaymentWeight = 0
+	config.IPWeight = 0
+	config.TimeWeight = 0
+	config.MergeThreshold = 0.60
+	config.StrongPairThreshold = 0.75
+
+	complete, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(complete.Output().Clusters); got != 2 {
+		t.Fatalf("complete linkage produced %d clusters, want 2", got)
+	}
+
+	config.LinkageRule = similarity.AverageStrongLinkage
+	average, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(average.Output().Clusters); got != 1 {
+		t.Fatalf("average-strong linkage produced %d clusters, want 1", got)
 	}
 }
 

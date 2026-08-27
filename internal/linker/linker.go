@@ -34,6 +34,9 @@ type State struct {
 }
 
 func Batch(accounts []model.Account, constraints []model.Constraint, config similarity.Config) (*State, error) {
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
 	ordered := append([]model.Account(nil), accounts...)
 	sort.Slice(ordered, func(i, j int) bool {
 		return ordered[i].AccountID < ordered[j].AccountID
@@ -49,16 +52,15 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 
 	scorer := similarity.New(config)
 	distinct := constraint.New(constraints)
-	index := newCandidateIndex(config)
-	pairs := make([]scoredPair, 0)
-	for i, account := range ordered {
-		for _, candidate := range index.candidates(account) {
-			score := scorer.Score(ordered[candidate], account)
-			if score >= config.MergeThreshold {
-				pairs = append(pairs, scoredPair{a: candidate, b: i, score: score})
-			}
+	scores := make([][]float64, len(ordered))
+	pairs := make([]scoredPair, 0, len(ordered)*(len(ordered)-1)/2)
+	for i := range ordered {
+		scores[i] = make([]float64, len(ordered))
+		for j := 0; j < i; j++ {
+			score := scorer.Score(ordered[j], ordered[i])
+			scores[i][j], scores[j][i] = score, score
+			pairs = append(pairs, scoredPair{a: j, b: i, score: score})
 		}
-		index.add(account, i)
 	}
 	sort.Slice(pairs, func(i, j int) bool {
 		if pairs[i].score != pairs[j].score {
@@ -71,15 +73,10 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 	})
 
 	components := newDSU(len(ordered))
-	for _, pair := range pairs {
-		ra := components.find(pair.a)
-		rb := components.find(pair.b)
-		if ra == rb {
-			continue
-		}
-		if canMerge(components.members[ra], components.members[rb], ordered, scorer, distinct, config.MergeThreshold) {
-			components.union(ra, rb)
-		}
+	if config.LinkageRule == similarity.AverageStrongLinkage {
+		agglomerateAverageStrong(components, scores, ordered, distinct, config)
+	} else {
+		agglomerateComplete(components, pairs, scores, ordered, distinct, config.MergeThreshold)
 	}
 
 	groups := make([][]int, 0)
@@ -122,18 +119,100 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 	return state, nil
 }
 
-func canMerge(aMembers, bMembers []int, accounts []model.Account, scorer similarity.Scorer, constraints *constraint.Set, threshold float64) bool {
+func validateConfig(config similarity.Config) error {
+	if config.MergeThreshold < 0 || config.MergeThreshold > 1 {
+		return fmt.Errorf("merge threshold must be in [0,1]")
+	}
+	if config.LinkageRule != similarity.CompleteLinkage && config.LinkageRule != similarity.AverageStrongLinkage {
+		return fmt.Errorf("unsupported linkage rule %q", config.LinkageRule)
+	}
+	if config.LinkageRule == similarity.AverageStrongLinkage &&
+		(config.StrongPairThreshold < config.MergeThreshold || config.StrongPairThreshold > 1) {
+		return fmt.Errorf("strong-pair threshold must be between merge threshold and 1")
+	}
+	return nil
+}
+
+func agglomerateComplete(components *dsu, pairs []scoredPair, scores [][]float64, accounts []model.Account, constraints *constraint.Set, threshold float64) {
+	for _, pair := range pairs {
+		if pair.score < threshold {
+			break
+		}
+		ra := components.find(pair.a)
+		rb := components.find(pair.b)
+		if ra == rb {
+			continue
+		}
+		if canMergeComplete(components.members[ra], components.members[rb], scores, accounts, constraints, threshold) {
+			components.union(ra, rb)
+		}
+	}
+}
+
+func canMergeComplete(aMembers, bMembers []int, scores [][]float64, accounts []model.Account, constraints *constraint.Set, threshold float64) bool {
 	for _, ai := range aMembers {
 		for _, bi := range bMembers {
 			if constraints.VerifiedDistinct(accounts[ai].AccountID, accounts[bi].AccountID) {
 				return false
 			}
-			if scorer.Score(accounts[ai], accounts[bi]) < threshold {
+			if scores[ai][bi] < threshold {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func agglomerateAverageStrong(components *dsu, scores [][]float64, accounts []model.Account, constraints *constraint.Set, config similarity.Config) {
+	for {
+		roots := make([]int, 0)
+		for i := range accounts {
+			if components.find(i) == i {
+				roots = append(roots, i)
+			}
+		}
+		bestA, bestB := -1, -1
+		bestAverage := -1.0
+		for i := 0; i < len(roots); i++ {
+			for j := i + 1; j < len(roots); j++ {
+				a, b := roots[i], roots[j]
+				average, strongest, valid := crossClusterStats(
+					components.members[a], components.members[b], scores, accounts, constraints,
+				)
+				if !valid || average < config.MergeThreshold || strongest < config.StrongPairThreshold {
+					continue
+				}
+				if average > bestAverage || (average == bestAverage &&
+					(bestA < 0 || a < bestA || (a == bestA && b < bestB))) {
+					bestA, bestB, bestAverage = a, b, average
+				}
+			}
+		}
+		if bestA < 0 {
+			return
+		}
+		components.union(bestA, bestB)
+	}
+}
+
+func crossClusterStats(aMembers, bMembers []int, scores [][]float64, accounts []model.Account, constraints *constraint.Set) (float64, float64, bool) {
+	total := 0.0
+	strongest := 0.0
+	pairs := 0
+	for _, ai := range aMembers {
+		for _, bi := range bMembers {
+			if constraints.VerifiedDistinct(accounts[ai].AccountID, accounts[bi].AccountID) {
+				return 0, 0, false
+			}
+			score := scores[ai][bi]
+			total += score
+			pairs++
+			if score > strongest {
+				strongest = score
+			}
+		}
+	}
+	return total / float64(pairs), strongest, true
 }
 
 func (s *State) Add(account model.Account) (model.StreamOutput, error) {
@@ -194,18 +273,31 @@ func (s *State) Add(account model.Account) (model.StreamOutput, error) {
 
 func (s *State) clusterScore(account model.Account, cluster *Cluster) (float64, bool) {
 	minimum := 1.0
+	total := 0.0
+	strongest := 0.0
 	for _, member := range cluster.Members {
 		existing := s.accounts[member]
 		if s.constraints.VerifiedDistinct(account.AccountID, existing.AccountID) {
 			return 0, false
 		}
 		score := s.scorer.Score(account, existing)
-		if score < s.config.MergeThreshold {
+		if s.config.LinkageRule == similarity.CompleteLinkage && score < s.config.MergeThreshold {
 			return 0, false
+		}
+		total += score
+		if score > strongest {
+			strongest = score
 		}
 		if score < minimum {
 			minimum = score
 		}
+	}
+	if s.config.LinkageRule == similarity.AverageStrongLinkage {
+		average := total / float64(len(cluster.Members))
+		if average < s.config.MergeThreshold || strongest < s.config.StrongPairThreshold {
+			return 0, false
+		}
+		return average, true
 	}
 	return minimum, true
 }
@@ -239,13 +331,20 @@ func (s *State) clusterConfidence(cluster *Cluster) float64 {
 		return s.config.SingletonConfidence
 	}
 	minimum := 1.0
+	total := 0.0
+	pairs := 0
 	for i := 0; i < len(cluster.Members); i++ {
 		for j := i + 1; j < len(cluster.Members); j++ {
 			score := s.scorer.Score(s.accounts[cluster.Members[i]], s.accounts[cluster.Members[j]])
+			total += score
+			pairs++
 			if score < minimum {
 				minimum = score
 			}
 		}
+	}
+	if s.config.LinkageRule == similarity.AverageStrongLinkage {
+		return total / float64(pairs)
 	}
 	return minimum
 }
