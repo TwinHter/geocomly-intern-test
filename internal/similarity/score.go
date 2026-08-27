@@ -195,6 +195,9 @@ func EmailLocal(email string) string {
 func EmailSimilarity(a, b string) float64 {
 	a = NormalizeEmail(a)
 	b = NormalizeEmail(b)
+	if a == "" || b == "" {
+		return 0
+	}
 	if a == b {
 		return 1
 	}

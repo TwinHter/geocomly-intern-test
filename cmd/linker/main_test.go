@@ -42,6 +42,12 @@ func TestDefaultConfig(t *testing.T) {
 	if config.MergeThreshold <= 0 || config.MergeThreshold > 1 {
 		t.Fatalf("invalid merge threshold %.4f", config.MergeThreshold)
 	}
+	if config.LinkageRule != similarity.CompleteLinkage {
+		t.Fatalf("default linkage = %q, want complete", config.LinkageRule)
+	}
+	if config.StrongPairThreshold < config.MergeThreshold || config.StrongPairThreshold > 1 {
+		t.Fatalf("invalid strong-pair threshold %.4f", config.StrongPairThreshold)
+	}
 }
 
 func TestEmailSimilarity(t *testing.T) {
@@ -140,6 +146,36 @@ func TestScoreMissingValuesAndBounds(t *testing.T) {
 	}
 }
 
+func TestBatchScoresAllPairsButStreamingUsesCandidates(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.EvidenceScale = 0.20
+	config.MergeThreshold = 0.80
+	config.StrongPairThreshold = 0.85
+	accounts := []model.Account{
+		{AccountID: "a", Email: "abcde@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "abxde@example.com", CreatedAt: testTime},
+	}
+	state, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(state.Output().Clusters); got != 1 {
+		t.Fatalf("all-pairs batch produced %d clusters, want 1", got)
+	}
+
+	streamState, err := linker.Batch(accounts[:1], nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment, err := streamState.Add(accounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ClusterID == "c1" {
+		t.Fatal("streaming unexpectedly found a pair with no shared block")
+	}
+}
+
 func TestStreamingUpdatesFrequencyState(t *testing.T) {
 	state, err := linker.Batch([]model.Account{testAccount("initial", "same@example.com")}, nil, similarity.DefaultConfig())
 	if err != nil {
@@ -183,6 +219,34 @@ func TestCompleteLinkageDoesNotUseNaiveTransitivity(t *testing.T) {
 		if len(cluster.AccountIDs) == 3 {
 			t.Fatalf("incompatible endpoints merged transitively: %+v", cluster)
 		}
+	}
+}
+
+func TestAverageStrongLinkageCanAcceptModerateAverage(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.EvidenceScale = 0.50
+	config.MergeThreshold = 0.65
+	config.StrongPairThreshold = 0.70
+	accounts := []model.Account{
+		{AccountID: "a", Email: "aaaaa@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "aaaab@example.com", CreatedAt: testTime},
+		{AccountID: "c", Email: "aaabb@example.com", CreatedAt: testTime},
+	}
+	complete, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(complete.Output().Clusters); got != 2 {
+		t.Fatalf("complete linkage produced %d clusters, want 2", got)
+	}
+
+	config.LinkageRule = similarity.AverageStrongLinkage
+	average, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(average.Output().Clusters); got != 1 {
+		t.Fatalf("average-strong linkage produced %d clusters, want 1", got)
 	}
 }
 
@@ -309,8 +373,8 @@ func TestLinkAndStreamCommands(t *testing.T) {
 	accountsPath := filepath.Join(temp, "accounts.jsonl")
 	constraintsPath := filepath.Join(temp, "constraints.jsonl")
 	outputPath := filepath.Join(temp, "clusters.json")
-	accounts := "{\"account_id\":\"a\",\"email\":\"same@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.1\",\"payment_fingerprint\":null,\"created_at\":\"2026-06-01T12:00:00Z\"}\n" +
-		"{\"account_id\":\"b\",\"email\":\"same+alt@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.2\",\"payment_fingerprint\":null,\"created_at\":\"2026-06-01T13:00:00Z\"}\n"
+	accounts := "{\"account_id\":\"a\",\"email\":\"same@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.1\",\"payment_fingerprint\":\"p\",\"created_at\":\"2026-06-01T12:00:00Z\"}\n" +
+		"{\"account_id\":\"b\",\"email\":\"same+alt@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.2\",\"payment_fingerprint\":\"p\",\"created_at\":\"2026-06-01T13:00:00Z\"}\n"
 	if err := os.WriteFile(accountsPath, []byte(accounts), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +396,7 @@ func TestLinkAndStreamCommands(t *testing.T) {
 		t.Fatalf("got %d clusters, want 1", len(batch.Clusters))
 	}
 
-	streamInput := "{\"account_id\":\"new\",\"email\":\"same@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.3\",\"payment_fingerprint\":null,\"created_at\":\"2026-06-01T14:00:00Z\"}\n"
+	streamInput := "{\"account_id\":\"new\",\"email\":\"same@example.com\",\"device_id\":\"d\",\"ip\":\"192.0.2.3\",\"payment_fingerprint\":\"p\",\"created_at\":\"2026-06-01T14:00:00Z\"}\n"
 	var stdout bytes.Buffer
 	if err := run([]string{"stream", "--accounts", accountsPath, "--constraints", constraintsPath}, strings.NewReader(streamInput), &stdout); err != nil {
 		t.Fatal(err)

@@ -27,8 +27,10 @@ func DefaultConfig() Config {
         Smoothing:      1,
         EvidenceScale:  0.75,
         MergeThreshold: 0.60,
-        IPHighFactor:   0.60,
-        IPMidFactor:    0.25,
+        StrongPairThreshold: 0.75,
+        LinkageRule:    CompleteLinkage,
+        IPHighFactor:   0.45,
+        IPMidFactor:    0.10,
         TimeEvidence:   0.25,
         // IP prefixes, time decay, and blocking limits follow.
     }
@@ -40,14 +42,14 @@ func DefaultConfig() Config {
 | `Smoothing` | Stabilizes `-log` rarity estimates for small datasets. |
 | `EvidenceScale` | Controls the saturation mapping from raw evidence to `[0,1]`. |
 | `MergeThreshold` | Lower values increase recall and false-positive risk; higher values increase precision. |
+| `StrongPairThreshold`, `LinkageRule` | Configure the optional average-linkage comparison. |
 | `IPHighFactor`, `IPMidFactor` | Make `/24` and `/16` evidence weaker than exact IP evidence. |
 | `TimeEvidence`, `TimeDecay` | Keep timestamp proximity as a small, smoothly decaying contribution. |
 | Email parameters | Control only n-gram candidate generation; email score strength comes from similarity and rarity. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-Missing values contribute no evidence. There are no independent email, device,
-payment, IP, or time weights. Changing blocking parameters affects which pairs
-are evaluated, but membership still requires the threshold and all constraints.
+Missing values contribute no evidence. There are no independent field weights.
+Batch scores every unordered pair; blocking parameters affect only streaming.
 
 ## Part 1: batch linking
 
@@ -72,8 +74,9 @@ The output is one JSON document:
 }
 ```
 
-Every input account appears exactly once. A merge is accepted only when every
-cross-cluster pair reaches the threshold and no pair is `verified_distinct`.
+Every input account appears exactly once. The default complete-linkage rule
+requires every all-pairs cross-cluster score to reach the threshold and forbids
+every `verified_distinct` merge.
 
 ## Part 2: incremental streaming
 
@@ -124,5 +127,7 @@ go run ./cmd/evaluate \
   --threshold 0.60
 ```
 
-It reports TP, FP, TN, FN, pairwise accuracy/precision/recall/F1, predicted
-clusters, and singleton clusters. Truth is never used by `cmd/linker`.
+Use `--linkage average-strong --strong-threshold 0.75` to reproduce the
+alternative rule. The evaluator reports F2, fraud-ring recovery, affected
+legitimate actors, business cost, constraints, and streaming candidate recall
+in addition to pairwise metrics. Truth is never used by `cmd/linker`.
