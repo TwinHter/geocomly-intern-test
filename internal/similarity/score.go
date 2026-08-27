@@ -198,14 +198,9 @@ func (s *Scorer) PairEvidence(a, b model.Account) Evidence {
 	}
 	if level, present := ipAgreement(a.IP, b.IP, s.Config); present {
 		u := s.model.ipU[level]
-		exact, high, mid := IPKeys(a.IP, s.Config)
-		switch level {
-		case ipExact:
+		if level == ipExact {
+			exact, _, _ := IPKeys(a.IP, s.Config)
 			u = s.valueProbability(s.model.ipExact, exact)
-		case ipHigh:
-			u = s.valueProbability(s.model.ipHigh, high)
-		case ipMid:
-			u = s.valueProbability(s.model.ipMid, mid)
 		}
 		result.IP = s.weight(s.Config.IPM[level], u)
 	}
@@ -216,6 +211,10 @@ func (s *Scorer) PairEvidence(a, b model.Account) Evidence {
 	result.Raw = result.Email + result.Device + result.Payment + result.IP + result.Time
 	result.Confidence = logistic(result.Raw)
 	return result
+}
+
+func (s *Scorer) Confidence(rawEvidence float64) float64 {
+	return logistic(rawEvidence)
 }
 
 func (s *Scorer) valueProbability(counts map[string]int, value string) float64 {
@@ -347,6 +346,9 @@ func EmailLocal(email string) string {
 func EmailSimilarity(a, b string) float64 {
 	a = NormalizeEmail(a)
 	b = NormalizeEmail(b)
+	if a == "" || b == "" {
+		return 0
+	}
 	if a == b {
 		return 1
 	}

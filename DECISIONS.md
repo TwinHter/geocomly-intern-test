@@ -10,21 +10,21 @@
 
 ## Algorithm choice
 
-Each field is reduced to a small agreement bucket. Email uses exact/very-high/medium/low local-part similarity; device and payment use exact/different; IP uses exact, `/24` (`/64` IPv6), `/16` (`/48`), or different; time uses four broad proximity buckets. A pair receives `sum(log(m/u))`, where centralized `m` arrays are sensible same-actor initial assumptions and `u` bucket rates come from up to 100,000 deterministic unordered pairs in the initial dataset. Exact values use their own empirical frequency for `u`, so rare device/payment matches provide more evidence than common shared values. Smoothing `0.5` prevents zero probabilities. These estimates are not claimed to be calibrated.
+Each field is reduced to a mutually exclusive agreement bucket. A pair receives `sum(log(m/u))`; centralized `m` arrays are validated positive distributions and `u` rates come from up to 100,000 deterministic pairs. Exact email, device, payment, and IP values use empirical value rarity. Subnets use level-level `u`, preventing a rare broad `/16` from becoming exact-like evidence. IP `m` is `0.45/0.20/0.05/0.30`, time `m` is monotonic `0.40/0.30/0.20/0.10`, and smoothing `0.5` prevents zero probabilities. Missing fields are omitted.
 
-The raw link threshold is `1.0`; output confidence is the logistic transform of raw evidence. All parameters live in `internal/similarity/config.go`. There are no manually assigned per-field weights.
+The selected raw threshold and fixed strong-pair threshold are both `3.0`; output confidence uses a numerically stable logistic transform. All parameters live in one config.
 
-Batch mode generates blocked candidate pairs, sorts passing pairs by score and account ID, and uses DSU only for component bookkeeping. A union occurs only if every cross-component pair meets the threshold and no pair is `verified_distinct`. Rejected merges do not stop later candidates. This conservative complete-linkage rule limits false-positive blast radius while still favoring the assignment's higher false-negative cost through fuzzy email and subnet candidates.
+Batch caches all pair evidence. The selected average-linkage rule requires average raw evidence at threshold, one cross pair at the fixed strong threshold, and no hard constraint. Complete linkage remains implemented and tested.
 
 ## Engineering design
 
-Exact email, device, payment, IP, subnet, and email-trigram indexes feed both batch and streaming paths; indexes never decide membership. Large blocks are capped at 256 entries and each event at 4,096 candidate accounts. Streaming skips conflicting clusters and tries later candidates as before. Its Fellegi-Sunter model is fixed from the initial dataset to avoid changing compatibility for existing clusters; only indexes and cluster state update online.
+Indexes feed streaming only. Streaming skips conflicting clusters, tries later candidates, and applies average raw evidence plus the same strong guard. Its FS model remains fixed from initialization.
 
 At 1M accounts, in-memory indexes and pair storage are the first pressure points. At 10M, DSU state, candidate postings, and complete cross-component checks need partitioning or durable storage. Cluster confidence is also quadratic in cluster size when batch output is written.
 
 ## Operating point
 
-The `main` baseline produced TP/FP/TN/FN `16/2/4916/16` and accuracy/precision/recall/F1 `99.6364%/88.8889%/50%/64%`. A raw-threshold sweep from `-1` to `4` selected `1.0` for this experiment: `20/10/4908/12` and `99.5556%/66.6667%/62.5%/64.5161%`. The added recall fits the much higher stated FN cost, though the precision reduction requires held-out validation. If false positives became more expensive, I would raise the evidence threshold.
+A predeclared coarse sweep selected average-strong at `3.0`: TP/FP/FN `23/1/9`, precision/recall/F1/F2 `95.83%/71.88%/82.14%/75.66%`. It recovered `1/2` fraud rings, affected two legitimate actors, and produced BusinessCost `2100`. Complete linkage at the same threshold had lower recall and F2. Streaming candidate recall was `31/32`. If false positives became more expensive, I would raise both evidence thresholds after held-out validation.
 
 ## Next steps
 

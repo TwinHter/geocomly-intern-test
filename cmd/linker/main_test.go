@@ -35,17 +35,33 @@ func verifiedDistinct(a, b string) model.Constraint {
 
 func permissiveConfig() similarity.Config {
 	config := similarity.DefaultConfig()
+	config.LinkageRule = similarity.CompleteLinkage
 	config.LinkEvidenceThreshold = -100
 	return config
 }
 
 func TestDefaultConfig(t *testing.T) {
 	config := similarity.DefaultConfig()
+	if err := config.Validate(); err != nil {
+		t.Fatalf("invalid default config: %v", err)
+	}
 	if config.Smoothing <= 0 || config.MaxEstimationPairs <= 0 {
 		t.Fatalf("invalid estimation config: %+v", config)
 	}
 	if config.EmailMediumThreshold >= config.EmailVeryHighThreshold {
 		t.Fatalf("email thresholds are not ordered: %+v", config)
+	}
+	if config.LinkageRule != similarity.AverageStrongLinkage {
+		t.Fatalf("default linkage = %q, want average-strong", config.LinkageRule)
+	}
+}
+
+func TestInvalidProbabilityConfigIsRejected(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.IPM[2] = 0
+	_, err := linker.Batch([]model.Account{testAccount("a", "a@example.com")}, nil, config)
+	if err == nil {
+		t.Fatal("Batch accepted an invalid zero m probability")
 	}
 }
 
@@ -61,6 +77,7 @@ func TestEmailSimilarity(t *testing.T) {
 		{name: "plus alias", a: "user+checkout@example.com", b: "user@example.com", min: 1, max: 1},
 		{name: "small typo", a: "john.doe@gmail.com", b: "j0hn.doe@gmail.com", min: 0.85, max: 0.95},
 		{name: "different local", a: "alice@gmail.com", b: "robert@gmail.com", min: 0, max: 0.20},
+		{name: "missing is not exact", a: "", b: "", min: 0, max: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -133,8 +150,40 @@ func TestDisagreementIsNegativeAndMissingIsNeutral(t *testing.T) {
 	}
 }
 
+func TestBatchScoresAllPairsButStreamingUsesCandidates(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.LinkageRule = similarity.CompleteLinkage
+	config.EmailVeryHighThreshold = 0.75
+	config.EmailM = [4]float64{0.05, 0.80, 0.10, 0.05}
+	config.LinkEvidenceThreshold = 0.20
+	accounts := []model.Account{
+		{AccountID: "a", Email: "abcde@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "abxde@example.com", CreatedAt: testTime},
+	}
+	state, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(state.Output().Clusters); got != 1 {
+		t.Fatalf("all-pairs batch produced %d clusters, want 1", got)
+	}
+
+	streamState, err := linker.Batch(accounts[:1], nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment, err := streamState.Add(accounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assignment.ClusterID == "c1" {
+		t.Fatal("streaming unexpectedly found a pair with no shared block")
+	}
+}
+
 func TestCompleteLinkageDoesNotUseNaiveTransitivity(t *testing.T) {
 	config := similarity.DefaultConfig()
+	config.LinkageRule = similarity.CompleteLinkage
 	config.EmailM = [4]float64{0.05, 0.80, 0.10, 0.05}
 	accounts := []model.Account{
 		{AccountID: "a", Email: "aaaaaaaaaa@example.com", CreatedAt: testTime},
@@ -160,6 +209,29 @@ func TestCompleteLinkageDoesNotUseNaiveTransitivity(t *testing.T) {
 		if len(cluster.AccountIDs) == 3 {
 			t.Fatalf("incompatible endpoints merged transitively: %+v", cluster)
 		}
+	}
+}
+
+func TestAverageStrongLinkageUsesRawEvidenceGuard(t *testing.T) {
+	config := similarity.DefaultConfig()
+	config.EmailM = [4]float64{0.05, 0.80, 0.10, 0.05}
+	accounts := []model.Account{
+		{AccountID: "a", Email: "aaaaaaaaaa@example.com", CreatedAt: testTime},
+		{AccountID: "b", Email: "aaaaaaaaba@example.com", CreatedAt: testTime},
+		{AccountID: "c", Email: "aaaaaaabba@example.com", CreatedAt: testTime},
+	}
+	scorer := similarity.New(config, accounts)
+	adjacent := math.Min(scorer.RawScore(accounts[0], accounts[1]), scorer.RawScore(accounts[1], accounts[2]))
+	endpoint := scorer.RawScore(accounts[0], accounts[2])
+	config.LinkEvidenceThreshold = (adjacent + endpoint) / 2
+	config.StrongEvidenceThreshold = adjacent
+	config.LinkageRule = similarity.AverageStrongLinkage
+	state, err := linker.Batch(accounts, nil, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(state.Output().Clusters); got != 1 {
+		t.Fatalf("average-strong linkage produced %d clusters, want 1", got)
 	}
 }
 

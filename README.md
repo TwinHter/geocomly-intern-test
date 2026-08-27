@@ -25,7 +25,9 @@ then rerun the tests and build.
 func DefaultConfig() Config {
     return Config{
         Smoothing:             0.5,
-        LinkEvidenceThreshold: 1.0,
+        LinkEvidenceThreshold:   3.0,
+        StrongEvidenceThreshold: 3.0,
+        LinkageRule:              AverageStrongLinkage,
         EmailM:                [4]float64{0.35, 0.30, 0.20, 0.15},
         DeviceM:               [2]float64{0.55, 0.45},
         // Payment, IP, time, bucket, and blocking parameters follow.
@@ -37,6 +39,7 @@ func DefaultConfig() Config {
 | --- | --- |
 | `Smoothing` | Prevents zero empirical probabilities and infinite log ratios. |
 | `LinkEvidenceThreshold` | Raw log-evidence required by complete-linkage; lower values favor recall. |
+| `StrongEvidenceThreshold`, `LinkageRule` | Configure the average-linkage strong-pair guard. |
 | `*M` arrays | Semi-empirical `P(agreement level | same actor)` assumptions. |
 | Email/time boundaries | Define the small set of agreement buckets. |
 | IP prefixes | Define exact, high-subnet, and mid-subnet agreement. |
@@ -44,8 +47,8 @@ func DefaultConfig() Config {
 
 The scorer estimates `u = P(level | different actor)` from deterministic sampled
 pairs in the initial account dataset. Missing values contribute no evidence.
-Changing blocking parameters affects candidates, but membership still requires
-the raw threshold and all constraint checks.
+Batch scores all unordered pairs. Blocking parameters affect only streaming;
+membership always requires the raw threshold and all constraint checks.
 
 ## Part 1: batch linking
 
@@ -70,8 +73,9 @@ The output is one JSON document:
 }
 ```
 
-Every input account appears exactly once. A merge is accepted only when every
-cross-cluster pair reaches the threshold and no pair is `verified_distinct`.
+Every input account appears exactly once. The selected rule requires average
+cross-cluster raw evidence at `3.0`, at least one cross pair at `3.0`, and no
+`verified_distinct` pair. Complete linkage remains available for comparison.
 
 ## Part 2: incremental streaming
 
@@ -110,8 +114,8 @@ go run ./cmd/evaluate \
   --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
   --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
   --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
-  --threshold 1.0
+  --threshold 3.0 --strong-threshold 3.0 --linkage average-strong
 ```
 
-It reports TP/FP/TN/FN, pairwise accuracy/precision/recall/F1, cluster counts,
-singletons, and constraint violations. `cmd/linker` never reads truth.
+It also reports F2, fraud-ring recovery, affected legitimate actors, business
+cost, and streaming candidate recall. `cmd/linker` never reads truth.
