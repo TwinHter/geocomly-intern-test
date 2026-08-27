@@ -19,11 +19,31 @@ func New(config Config) Scorer {
 }
 
 func (s Scorer) Score(a, b model.Account) float64 {
-	score := s.Config.EmailWeight*s.emailSimilarity(a.Email, b.Email) +
-		s.Config.DeviceWeight*s.exactOrMissing(a.DeviceID, b.DeviceID) +
-		s.Config.PaymentWeight*s.exactOrMissing(a.PaymentFingerprint, b.PaymentFingerprint) +
-		s.Config.IPWeight*s.IPSimilarity(a.IP, b.IP) +
-		s.Config.TimeWeight*s.TimeSimilarity(a.CreatedAt, b.CreatedAt)
+	numerator := 0.0
+	denominator := 0.0
+	meaningful := false
+	add := func(weight, value float64, available, identitySignal bool) {
+		if !available || weight <= 0 {
+			return
+		}
+		numerator += weight * value
+		denominator += weight
+		meaningful = meaningful || identitySignal
+	}
+	email, emailAvailable := s.emailSimilarity(a.Email, b.Email)
+	device, deviceAvailable := exactSimilarity(a.DeviceID, b.DeviceID)
+	payment, paymentAvailable := exactSimilarity(a.PaymentFingerprint, b.PaymentFingerprint)
+	ip, ipAvailable := s.ipSimilarity(a.IP, b.IP)
+	timeScore, timeAvailable := s.timeSimilarity(a.CreatedAt, b.CreatedAt)
+	add(s.Config.EmailWeight, email, emailAvailable, true)
+	add(s.Config.DeviceWeight, device, deviceAvailable, true)
+	add(s.Config.PaymentWeight, payment, paymentAvailable, true)
+	add(s.Config.IPWeight, ip, ipAvailable, true)
+	add(s.Config.TimeWeight, timeScore, timeAvailable, false)
+	if denominator == 0 || !meaningful {
+		return 0
+	}
+	score := numerator / denominator
 	if score < 0 {
 		return 0
 	}
@@ -33,28 +53,25 @@ func (s Scorer) Score(a, b model.Account) float64 {
 	return score
 }
 
-func (s Scorer) emailSimilarity(a, b string) float64 {
-	if NormalizeEmail(a) == "" || NormalizeEmail(b) == "" {
-		return s.Config.MissingValueScore
+func (s Scorer) emailSimilarity(a, b string) (float64, bool) {
+	a = NormalizeEmail(a)
+	b = NormalizeEmail(b)
+	if a == "" || b == "" {
+		return 0, false
 	}
-	return weightedEmailSimilarity(
-		a,
-		b,
-		s.Config.EmailLocalPartWeight,
-		s.Config.EmailDomainPartWeight,
-	)
+	return fuzzyEmailSimilarity(a, b, s.Config.EmailExactDomainBonus, s.Config.FuzzyEmailMax), true
 }
 
-func (s Scorer) exactOrMissing(a, b string) float64 {
+func exactSimilarity(a, b string) (float64, bool) {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
 	if a == "" || b == "" {
-		return s.Config.MissingValueScore
+		return 0, false
 	}
 	if a == b {
-		return 1
+		return 1, true
 	}
-	return 0
+	return 0, true
 }
 
 func NormalizeEmail(email string) string {
@@ -80,10 +97,10 @@ func EmailLocal(email string) string {
 
 func EmailSimilarity(a, b string) float64 {
 	config := DefaultConfig()
-	return weightedEmailSimilarity(a, b, config.EmailLocalPartWeight, config.EmailDomainPartWeight)
+	return fuzzyEmailSimilarity(a, b, config.EmailExactDomainBonus, config.FuzzyEmailMax)
 }
 
-func weightedEmailSimilarity(a, b string, localWeight, domainWeight float64) float64 {
+func fuzzyEmailSimilarity(a, b string, exactDomainBonus, fuzzyMaximum float64) float64 {
 	a = NormalizeEmail(a)
 	b = NormalizeEmail(b)
 	if a == "" || b == "" {
@@ -95,10 +112,20 @@ func weightedEmailSimilarity(a, b string, localWeight, domainWeight float64) flo
 	aLocal, aDomain, aFound := strings.Cut(a, "@")
 	bLocal, bDomain, bFound := strings.Cut(b, "@")
 	if !aFound || !bFound {
-		return normalizedLevenshtein(a, b)
+		return minFloat(normalizedLevenshtein(a, b), fuzzyMaximum)
 	}
-	return localWeight*normalizedLevenshtein(aLocal, bLocal) +
-		domainWeight*normalizedLevenshtein(aDomain, bDomain)
+	result := (1 - exactDomainBonus) * normalizedLevenshtein(aLocal, bLocal)
+	if aDomain == bDomain {
+		result += exactDomainBonus
+	}
+	return minFloat(result, fuzzyMaximum)
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func normalizedLevenshtein(a, b string) float64 {
@@ -152,23 +179,28 @@ func min3(a, b, c int) int {
 }
 
 func (s Scorer) IPSimilarity(a, b string) float64 {
+	score, _ := s.ipSimilarity(a, b)
+	return score
+}
+
+func (s Scorer) ipSimilarity(a, b string) (float64, bool) {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
 	if a == "" || b == "" {
-		return s.Config.MissingValueScore
+		return 0, false
 	}
 	addrA, errA := netip.ParseAddr(a)
 	addrB, errB := netip.ParseAddr(b)
 	if errA != nil || errB != nil {
-		return 0
+		return 0, true
 	}
 	addrA = addrA.Unmap()
 	addrB = addrB.Unmap()
 	if addrA.Is4() != addrB.Is4() {
-		return 0
+		return 0, true
 	}
 	if addrA == addrB {
-		return 1
+		return 1, true
 	}
 	highBits := s.Config.IPv6HighPrefixBits
 	midBits := s.Config.IPv6MidPrefixBits
@@ -177,17 +209,22 @@ func (s Scorer) IPSimilarity(a, b string) float64 {
 		midBits = s.Config.IPv4MidPrefixBits
 	}
 	if netip.PrefixFrom(addrA, highBits).Masked() == netip.PrefixFrom(addrB, highBits).Masked() {
-		return s.Config.IPHighScore
+		return s.Config.IPHighScore, true
 	}
 	if netip.PrefixFrom(addrA, midBits).Masked() == netip.PrefixFrom(addrB, midBits).Masked() {
-		return s.Config.IPMidScore
+		return s.Config.IPMidScore, true
 	}
-	return 0
+	return 0, true
 }
 
 func (s Scorer) TimeSimilarity(a, b time.Time) float64 {
+	score, _ := s.timeSimilarity(a, b)
+	return score
+}
+
+func (s Scorer) timeSimilarity(a, b time.Time) (float64, bool) {
 	if a.IsZero() || b.IsZero() {
-		return s.Config.MissingValueScore
+		return 0, false
 	}
 	delta := a.Sub(b)
 	if delta < 0 {
@@ -195,15 +232,15 @@ func (s Scorer) TimeSimilarity(a, b time.Time) float64 {
 	}
 	switch {
 	case delta <= s.Config.TimeVeryClose:
-		return 1
+		return 1, true
 	case delta <= s.Config.TimeClose:
-		return s.Config.TimeCloseScore
+		return s.Config.TimeCloseScore, true
 	case delta <= s.Config.TimeModerate:
-		return s.Config.TimeModerateScore
+		return s.Config.TimeModerateScore, true
 	case delta <= s.Config.TimeFar:
-		return s.Config.TimeFarScore
+		return s.Config.TimeFarScore, true
 	default:
-		return 0
+		return 0, true
 	}
 }
 

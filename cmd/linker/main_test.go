@@ -46,6 +46,9 @@ func TestDefaultConfig(t *testing.T) {
 	if config.NeutralSimilarity <= 0 || config.NeutralSimilarity >= 1 {
 		t.Fatalf("invalid neutral similarity %.4f", config.NeutralSimilarity)
 	}
+	if !config.NormalizeClusterSupport {
+		t.Fatal("cluster support must be size-normalized by default")
+	}
 }
 
 func TestEmailSimilarity(t *testing.T) {
@@ -59,7 +62,8 @@ func TestEmailSimilarity(t *testing.T) {
 		{name: "normalized exact", a: " User@Example.com ", b: "user@example.com", min: 1, max: 1},
 		{name: "plus alias", a: "user+checkout@example.com", b: "user@example.com", min: 1, max: 1},
 		{name: "small typo", a: "john.doe@gmail.com", b: "j0hn.doe@gmail.com", min: 0.85, max: 0.95},
-		{name: "different local", a: "alice@gmail.com", b: "robert@gmail.com", min: 0.10, max: 0.40},
+		{name: "common domain is weak", a: "alice@gmail.com", b: "robert@gmail.com", min: 0, max: 0.10},
+		{name: "domain is not fuzzy matched", a: "alice@gmail.com", b: "alice@hotmail.com", min: 0.80, max: 0.85},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -80,13 +84,13 @@ func TestIPSimilarity(t *testing.T) {
 		want float64
 	}{
 		{name: "IPv4 exact", a: "203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "IPv4 /24", a: "203.0.113.4", b: "203.0.113.90", want: 0.85},
-		{name: "IPv4 /16", a: "203.0.113.4", b: "203.0.9.1", want: 0.55},
+		{name: "IPv4 /24", a: "203.0.113.4", b: "203.0.113.90", want: 0.45},
+		{name: "IPv4 /16", a: "203.0.113.4", b: "203.0.9.1", want: 0.15},
 		{name: "IPv4 different", a: "203.0.113.4", b: "198.51.100.1", want: 0},
-		{name: "IPv6 /64", a: "2001:db8:1:2::1", b: "2001:db8:1:2::99", want: 0.85},
-		{name: "IPv6 /48", a: "2001:db8:1:2::1", b: "2001:db8:1:9::1", want: 0.55},
+		{name: "IPv6 /64", a: "2001:db8:1:2::1", b: "2001:db8:1:2::99", want: 0.45},
+		{name: "IPv6 /48", a: "2001:db8:1:2::1", b: "2001:db8:1:9::1", want: 0.15},
 		{name: "IPv4 mapped", a: "::ffff:203.0.113.4", b: "203.0.113.4", want: 1},
-		{name: "missing", a: "", b: "203.0.113.4", want: 0.20},
+		{name: "missing", a: "", b: "203.0.113.4", want: 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -97,24 +101,19 @@ func TestIPSimilarity(t *testing.T) {
 	}
 }
 
-func TestScoreMissingValuesAndBounds(t *testing.T) {
+func TestScoreIgnoresMissingValuesAndRenormalizes(t *testing.T) {
 	config := similarity.DefaultConfig()
 	scorer := similarity.New(config)
 	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	a := model.Account{Email: "same@example.com", CreatedAt: created}
-	want := config.EmailWeight + config.DeviceWeight*config.MissingValueScore +
-		config.PaymentWeight*config.MissingValueScore + config.IPWeight*config.MissingValueScore + config.TimeWeight
-	if got := scorer.Score(a, a); math.Abs(got-want) > 1e-9 {
-		t.Fatalf("Score() = %.4f, want %.4f", got, want)
+	if got := scorer.Score(a, a); got != 1 {
+		t.Fatalf("exact available fields score = %.4f, want 1", got)
 	}
-
-	config.EmailWeight = 1
-	config.DeviceWeight = 0
-	config.PaymentWeight = 0
-	config.IPWeight = 0
-	config.TimeWeight = 0
-	if got := similarity.New(config).Score(model.Account{}, model.Account{}); got != config.MissingValueScore {
-		t.Fatalf("missing email score = %.4f, want %.4f", got, config.MissingValueScore)
+	if got := scorer.Score(model.Account{}, model.Account{}); got != 0 {
+		t.Fatalf("all-missing score = %.4f, want 0", got)
+	}
+	if got := scorer.Score(model.Account{CreatedAt: created}, model.Account{CreatedAt: created}); got != 0 {
+		t.Fatalf("timestamp-only score = %.4f, want 0", got)
 	}
 
 	exact := model.Account{
@@ -140,13 +139,13 @@ func TestSignedEdgeConversion(t *testing.T) {
 
 func TestAgglomerativePositiveAndNegativeGain(t *testing.T) {
 	positive := [][]float64{{0, 0.4}, {0.4, 0}}
-	groups, steps := linker.Agglomerate(positive, boolMatrix(2))
+	groups, steps := linker.Agglomerate(positive, boolMatrix(2), true)
 	if len(groups) != 1 || len(steps) != 1 || steps[0].Gain != 0.4 {
 		t.Fatalf("positive edge did not merge: groups=%v steps=%+v", groups, steps)
 	}
 
 	negative := [][]float64{{0, -0.1}, {-0.1, 0}}
-	groups, steps = linker.Agglomerate(negative, boolMatrix(2))
+	groups, steps = linker.Agglomerate(negative, boolMatrix(2), true)
 	if len(groups) != 2 || len(steps) != 0 {
 		t.Fatalf("negative edge merged: groups=%v steps=%+v", groups, steps)
 	}
@@ -160,7 +159,7 @@ func TestAgglomerativeBestLegalMergeAndHardConstraint(t *testing.T) {
 	}
 	blocked := boolMatrix(3)
 	blocked[0][2], blocked[2][0] = true, true
-	groups, steps := linker.Agglomerate(edges, blocked)
+	groups, steps := linker.Agglomerate(edges, blocked, true)
 	if len(steps) == 0 || steps[0].LeftKey != 0 || steps[0].RightKey != 1 {
 		t.Fatalf("best blocked merge prevented valid fallback: groups=%v steps=%+v", groups, steps)
 	}
@@ -186,7 +185,7 @@ func TestAgglomerativeTieBreakAndMonotonicObjective(t *testing.T) {
 		{0.5, 0, 0.2},
 		{0.5, 0.2, 0},
 	}
-	_, steps := linker.Agglomerate(edges, boolMatrix(3))
+	_, steps := linker.Agglomerate(edges, boolMatrix(3), true)
 	if len(steps) == 0 || steps[0].LeftKey != 0 || steps[0].RightKey != 1 {
 		t.Fatalf("unexpected deterministic tie-break: %+v", steps)
 	}
@@ -196,6 +195,23 @@ func TestAgglomerativeTieBreakAndMonotonicObjective(t *testing.T) {
 			t.Fatalf("accepted merge did not improve objective: %+v", steps)
 		}
 		previous = step.Objective
+	}
+}
+
+func TestNormalizedSupportAvoidsLargeClusterSizeBias(t *testing.T) {
+	edges := [][]float64{
+		{0, 1.0, -1.0, 0.3},
+		{1.0, 0, -1.0, 0.3},
+		{-1.0, -1.0, 0, 0.5},
+		{0.3, 0.3, 0.5, 0},
+	}
+	normalized, _ := linker.Agglomerate(edges, boolMatrix(4), true)
+	rawSum, _ := linker.Agglomerate(edges, boolMatrix(4), false)
+	if !reflect.DeepEqual(normalized, [][]int{{0, 1}, {2, 3}}) {
+		t.Fatalf("normalized support groups = %v, want [[0 1] [2 3]]", normalized)
+	}
+	if !reflect.DeepEqual(rawSum, [][]int{{0, 1, 3}, {2}}) {
+		t.Fatalf("raw-sum groups = %v, want size-biased [[0 1 3] [2]]", rawSum)
 	}
 }
 

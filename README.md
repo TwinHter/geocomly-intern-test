@@ -23,14 +23,14 @@ All tunable values are centralized in `internal/similarity/config.go` inside
 ```go
 func DefaultConfig() Config {
     return Config{
-        EmailWeight:        0.50,
-        DeviceWeight:       0.175,
-        PaymentWeight:      0.175,
-        IPWeight:           0.10,
-        TimeWeight:         0.05,
-        MissingValueScore:  0.20,
-        MergeThreshold:     0.44,
+        EmailWeight:        0.40,
+        DeviceWeight:       0.25,
+        PaymentWeight:      0.25,
+        IPWeight:           0.08,
+        TimeWeight:         0.02,
+        MergeThreshold:     0.55,
         NeutralSimilarity:  0.45,
+        NormalizeClusterSupport: true,
         // Other email, IP, time, and blocking parameters follow.
     }
 }
@@ -44,14 +44,14 @@ normalized to `[0, 1]`.
 | `*Weight` | Relative contribution of email, device, payment, IP, and time. |
 | `MergeThreshold` | Retained baseline setting; correlation decisions do not use it. |
 | `NeutralSimilarity` | Centers baseline similarity into signed correlation edges. |
-| `MissingValueScore` | Evidence assigned when a signal is unknown; weights are not renormalized. |
-| Email parameters | Control local/domain scoring and n-gram candidate generation. |
+| `NormalizeClusterSupport` | Selects average rather than size-biased raw-sum merge support. |
+| Email parameters | Control local fuzzy scoring, exact-domain bonus, and streaming n-grams. |
 | IP/time parameters | Control subnet and timestamp-distance similarity buckets. |
 | `MaxBlockSize`, `MaxCandidates` | Bound candidate work and streaming latency on common signals. |
 
-`NeutralSimilarity` is the only parameter added by this experiment. Baseline
-field scoring remains unchanged. Blocking parameters affect streaming candidate
-generation; batch correlation clustering precomputes all pair scores.
+Missing fields add no evidence and available fields are renormalized. Domains
+are not fuzzy matched and broad subnets are weak. Blocking parameters affect
+streaming only; batch precomputes all pair scores.
 
 ## Part 1: batch linking
 
@@ -77,7 +77,7 @@ The output is one JSON document:
 ```
 
 Every input account appears exactly once. Batch starts from singletons and
-repeatedly accepts the legal cluster merge with the largest positive sum of
+repeatedly accepts the legal cluster merge with the largest positive average of
 cross-cluster signed edges. `verified_distinct` always forbids a merge.
 
 ## Part 2: incremental streaming
@@ -104,7 +104,7 @@ The program immediately flushes one assignment line to stdout:
 
 Streaming initializes clusters once with the batch algorithm. Each new account
 uses the maintained indexes and joins the legal candidate cluster with the
-largest positive insertion gain, or creates a deterministic singleton. It does
+largest positive average insertion support, or creates a deterministic singleton. It does
 not globally recluster historical accounts.
 
 ## Offline evaluation
@@ -116,8 +116,9 @@ go run ./cmd/evaluate \
   --accounts ../202608-intern-takehome-assignment/datasets/sample_accounts.jsonl \
   --constraints ../202608-intern-takehome-assignment/datasets/sample_constraints.jsonl \
   --truth ../202608-intern-takehome-assignment/datasets/sample_truth.json \
-  --neutral 0.45
+  --neutral 0.45 --support average
 ```
 
-It reports TP/FP/TN/FN, pairwise metrics, clusters, singletons, and constraint
-violations. `cmd/linker` never reads truth.
+Use `--support sum` only to reproduce the previous behavior. The evaluator also
+reports F2, fraud-ring recovery, affected legitimate actors, business cost, and
+streaming candidate recall. `cmd/linker` never reads truth.

@@ -114,3 +114,18 @@ func (idx *candidateIndex) ipKeys(raw string) (exact, high, mid string) {
 	}
 	return addr.String(), netip.PrefixFrom(addr, highBits).Masked().String(), netip.PrefixFrom(addr, midBits).Masked().String()
 }
+
+// StreamingCandidatePairs exposes deterministic blocking coverage for offline diagnostics.
+func StreamingCandidatePairs(accounts []model.Account, config similarity.Config) [][2]string {
+	ordered := append([]model.Account(nil), accounts...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].AccountID < ordered[j].AccountID })
+	idx := newCandidateIndex(config)
+	pairs := make([][2]string, 0)
+	for i, account := range ordered {
+		for _, candidate := range idx.candidates(account) {
+			pairs = append(pairs, [2]string{ordered[candidate].AccountID, account.AccountID})
+		}
+		idx.add(account, i)
+	}
+	return pairs
+}

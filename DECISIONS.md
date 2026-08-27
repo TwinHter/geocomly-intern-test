@@ -4,25 +4,25 @@
 
 - Account IDs are unique and `created_at` is valid RFC3339. Invalid records stop processing instead of producing partial, ambiguous state.
 - Email local-part text after the first `+` is treated as an alias tag because this is common across major providers.
-- Missing email, device, payment, or IP values mean unknown. They receive a fixed score of `0.20`; weights are not renormalized.
+- Missing values mean unknown and add no evidence. Scores are renormalized over fields present in both records; timestamp alone is insufficient.
 - Constraints may mention accounts that arrive later in streaming mode, so all pairs are retained by account ID.
 - Singleton confidence is `1.0`. Confidence is a deterministic compatibility heuristic, not a probability.
 
 ## Algorithm choice
 
-The baseline weighted pair scorer is unchanged. Its `[0,1]` compatibility becomes a signed graph edge with `score - 0.45`; positive edges favor co-clustering and negative edges favor separation. Batch precomputes every pair score, starts from singleton clusters, and repeatedly merges the legal cluster pair with the highest positive sum of cross-cluster edges. Maximizing internal signed weight is equivalent to the correlation objective up to a constant, and every accepted merge increases it by the reported gain.
+The corrected baseline uses email/device/payment/IP/time weights `0.40/0.25/0.25/0.08/0.02`, local-only fuzzy email with a small exact-domain bonus, and weak `/16` evidence. Compatibility becomes `score - 0.45`. Batch starts from singletons and selects the legal merge with highest positive average cross-cluster edge. Average support removes the old size bias while every accepted merge still increases the raw signed objective.
 
-Merge gains and cannot-link state are cached and updated additively. `verified_distinct` is a hard invalid merge rather than a large negative edge; a blocked best pair does not stop another legal merge. Node/account order provides deterministic tie-breaking. I skipped local search to keep this experiment focused and maintainable.
+Raw edge sums and cannot-link state are cached and updated additively; sums are divided by cross-pair count only for selection. `verified_distinct` is a hard reject, and account order provides deterministic tie-breaking.
 
 ## Engineering design
 
-Batch stores an `O(N^2)` edge matrix and uses a clear `O(N^3)` agglomerative scan, appropriate for the small experiment dataset but not millions of accounts. Streaming remains incremental: indexes identify candidate clusters, insertion gain is the sum of signed edges to all cluster members, constrained clusters are skipped, and unrelated historical accounts are never reclustered. This is an online approximation of the batch objective.
+Batch stores an `O(N^2)` edge matrix and uses a clear `O(N^3)` agglomerative scan. Streaming indexes candidate clusters, uses average signed-edge insertion support, skips constrained clusters, and never reclusters historical accounts.
 
 At 1M accounts, the pair matrix fails first; a production version would require sparse candidate edges, a priority queue, and partitioned clustering. Cluster confidence is the average internal baseline similarity and remains quadratic in cluster size when output is written.
 
 ## Operating point
 
-The `main` baseline produced TP/FP/TN/FN `16/2/4916/16` and accuracy/precision/recall/F1 `99.6364%/88.8889%/50%/64%`. A neutral-similarity sweep from `0.30` to `0.60` selected `0.45`: `16/3/4915/16` and `99.6162%/84.2105%/50%/62.7451%`. The global heuristic does not beat the conservative baseline on this sample; it adds one false-positive pair without recovering a positive pair. If false positives became more expensive, I would increase the neutral point.
+A predeclared neutral sweep selected `0.45` by F2: TP/FP/FN `15/11/17`, precision/recall/F1/F2 `57.69%/46.88%/51.72%/48.70%`. It recovered `0/2` rings and affected ten legitimate actors. BusinessCost is degenerate because every setting missed both rings. Raw-sum and average support happened to match on the sample, but a regression graph demonstrates the old large-cluster bias. If false positives became more expensive, I would increase the neutral point.
 
 ## Next steps
 

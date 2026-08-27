@@ -63,7 +63,7 @@ func Batch(accounts []model.Account, constraints []model.Constraint, config simi
 			cannotLink[i][j], cannotLink[j][i] = blocked, blocked
 		}
 	}
-	groups, _ := Agglomerate(edges, cannotLink)
+	groups, _ := Agglomerate(edges, cannotLink, config.NormalizeClusterSupport)
 
 	state := &State{
 		config:         config,
@@ -123,16 +123,16 @@ func (s *State) Add(account model.Account) (model.StreamOutput, error) {
 	accountIndex := len(s.accounts)
 	computedEdges := make(map[pairKey]float64)
 	var best *Cluster
-	bestGain := 0.0
+	bestSupport := 0.0
 	bestConfidence := s.config.SingletonConfidence
 	for _, cluster := range orderedClusters {
-		gain, confidence, valid := s.insertionGain(account, accountIndex, cluster, computedEdges)
-		if !valid || gain <= 0 {
+		support, confidence, valid := s.insertionSupport(account, accountIndex, cluster, computedEdges)
+		if !valid || support <= 0 {
 			continue
 		}
-		if gain > bestGain || (gain == bestGain && (best == nil || cluster.Order < best.Order)) {
+		if support > bestSupport || (support == bestSupport && (best == nil || cluster.Order < best.Order)) {
 			best = cluster
-			bestGain = gain
+			bestSupport = support
 			bestConfidence = confidence
 		}
 	}
@@ -160,7 +160,7 @@ func (s *State) Add(account model.Account) (model.StreamOutput, error) {
 	}, nil
 }
 
-func (s *State) insertionGain(account model.Account, accountIndex int, cluster *Cluster, cache map[pairKey]float64) (float64, float64, bool) {
+func (s *State) insertionSupport(account model.Account, accountIndex int, cluster *Cluster, cache map[pairKey]float64) (float64, float64, bool) {
 	gain := 0.0
 	similaritySum := 0.0
 	for _, member := range cluster.Members {
@@ -173,6 +173,9 @@ func (s *State) insertionGain(account model.Account, accountIndex int, cluster *
 		cache[newPairKey(accountIndex, member)] = edge
 		gain += edge
 		similaritySum += score
+	}
+	if s.config.NormalizeClusterSupport {
+		gain /= float64(len(cluster.Members))
 	}
 	return gain, similaritySum / float64(len(cluster.Members)), true
 }

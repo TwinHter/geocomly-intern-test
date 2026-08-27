@@ -7,6 +7,7 @@ type MergeStep struct {
 	LeftKey   int
 	RightKey  int
 	Gain      float64
+	Support   float64
 	Objective float64
 }
 
@@ -19,9 +20,9 @@ func SignedEdge(score, neutralSimilarity float64) float64 {
 	return score - neutralSimilarity
 }
 
-// Agglomerate merges the legal cluster pair with the highest positive gain.
+// Agglomerate merges the legal cluster pair with the highest positive support.
 // Node indices define deterministic tie-breaking.
-func Agglomerate(edges [][]float64, cannotLink [][]bool) ([][]int, []MergeStep) {
+func Agglomerate(edges [][]float64, cannotLink [][]bool, normalizeSupport bool) ([][]int, []MergeStep) {
 	clusters := make([]graphCluster, len(edges))
 	gains := make([][]float64, len(edges))
 	blocked := make([][]bool, len(edges))
@@ -36,6 +37,7 @@ func Agglomerate(edges [][]float64, cannotLink [][]bool) ([][]int, []MergeStep) 
 	for {
 		bestLeft, bestRight := -1, -1
 		bestGain := 0.0
+		bestSupport := 0.0
 		for left := 0; left < len(clusters); left++ {
 			if !clusters[left].active {
 				continue
@@ -45,9 +47,14 @@ func Agglomerate(edges [][]float64, cannotLink [][]bool) ([][]int, []MergeStep) 
 					continue
 				}
 				gain := gains[left][right]
-				if gain > bestGain || (gain == bestGain && gain > 0 &&
+				support := gain
+				if normalizeSupport {
+					support /= float64(len(clusters[left].members) * len(clusters[right].members))
+				}
+				if support > bestSupport || (support == bestSupport && support > 0 &&
 					(bestLeft < 0 || left < bestLeft || (left == bestLeft && right < bestRight))) {
-					bestLeft, bestRight, bestGain = left, right, gain
+					bestLeft, bestRight = left, right
+					bestGain, bestSupport = gain, support
 				}
 			}
 		}
@@ -60,6 +67,7 @@ func Agglomerate(edges [][]float64, cannotLink [][]bool) ([][]int, []MergeStep) 
 			LeftKey:   clusters[bestLeft].members[0],
 			RightKey:  clusters[bestRight].members[0],
 			Gain:      bestGain,
+			Support:   bestSupport,
 			Objective: objective,
 		})
 		clusters[bestLeft].members = append(clusters[bestLeft].members, clusters[bestRight].members...)
